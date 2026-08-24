@@ -7,8 +7,9 @@ Kubernetes sit on top of, built to understand it rather than to replace it.
 a filesystem bundle and a `config.json`, then uses Linux namespaces, cgroup v2, and OverlayFS to
 turn it into an isolated process. The goal is to be a drop-in `--runtime` for Docker.
 
-> **Status: early.** Environment and CLI surface are in place. The isolation core, cgroup driver,
-> and lifecycle are not implemented yet. See [Roadmap](#roadmap) for exactly what works today.
+> **Status: early.** `mars run` starts real isolated containers today — namespaces, `pivot_root`,
+> PID 1, signal forwarding, exit code propagation. There is no cgroup driver yet, so resource
+> limits are not enforced, and `create`/`start` are not yet split. See [Roadmap](#roadmap).
 
 ## Why build this when runc exists?
 
@@ -26,8 +27,10 @@ failures in production happen in the layer that Docker hides:
 Reading the documentation does not build a mental model for these. Writing the runtime does.
 
 The verifiable outputs are the point: passing the OCI validation suite, running as
-`docker run --runtime=mars`, and [`docs/failure-modes.md`](docs/) reproducing each failure above
-with evidence read straight from the kernel.
+`docker run --runtime=mars`, and [`docs/failure-modes.md`](docs/failure-modes.md) reproducing each
+failure above with evidence read straight from the kernel. Two are written up already — why
+`docker stop` appears to do nothing for ten seconds, and why mounting `/sys/fs/cgroup` fails with
+`EPERM` on a modern host while running as root.
 
 ## Design notes
 
@@ -87,7 +90,7 @@ networking, checkpoint/restore, CRI, cgroup v1, and the systemd cgroup driver.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Dev VM, toolchain, CLI surface, `spec` generation | done |
-| 1 | Namespaces, `pivot_root`, PID 1 duties | not started |
+| 1 | Namespaces, `pivot_root`, PID 1 duties — [writeup](docs/01-isolation.md) | done |
 | 2 | cgroup v2 driver, OOMKilled reproduction | not started |
 | 3 | OverlayFS, OCI bundle parsing | not started |
 | 4 | Full lifecycle, passes OCI validation | not started |
@@ -106,7 +109,16 @@ limactl shell mars-dev
 
 cargo build
 cargo test
-./target/debug/mars spec --bundle /tmp/demo
+sudo -E ./tests/run-integration.sh
+```
+
+The integration suite asserts against kernel state — `/proc`, `/proc/mounts`, `ip -o link`, wait
+statuses — rather than trusting what the runtime reports about itself. To drive it by hand:
+
+```sh
+mars spec --bundle /tmp/demo
+./scripts/make-rootfs.sh /tmp/demo/rootfs
+cd /tmp/demo && sudo mars run demo
 ```
 
 Verified environment: Ubuntu 24.04, kernel 6.8, aarch64, pure cgroup v2 (`cgroup2fs`) with

@@ -32,6 +32,8 @@ nix = { version = "0.31", features = [
   "resource",
   "user",
   "ioctl",
+  "socket",
+  "uio",
 ] }
 oci-spec = "0.10"
 serde = { version = "1", features = ["derive"] }

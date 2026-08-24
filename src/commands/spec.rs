@@ -23,6 +23,7 @@ pub fn run(args: &SpecArgs, rootless: bool) -> Result<()> {
 
     let mut spec = Spec::default();
     spec.set_version(crate::OCI_VERSION.to_string());
+    spec.set_hostname(Some("mars".to_string()));
 
     let mut json = serde_json::to_string_pretty(&spec)?;
     json.push('\n');

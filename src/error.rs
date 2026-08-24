@@ -21,6 +21,27 @@ pub enum Error {
     #[error("bundle {0} has no config.json")]
     MissingConfig(PathBuf),
 
+    #[error("config.json is missing required field {0}")]
+    SpecField(&'static str),
+
+    #[error("rootfs {0} does not exist or is not a directory")]
+    RootfsMissing(PathBuf),
+
+    #[error("executable {0:?} not found in the container PATH")]
+    ExecutableNotFound(String),
+
+    #[error("{0:?} contains a nul byte and cannot be passed to execve")]
+    NulByte(String),
+
+    #[error("container init failed: {0}")]
+    InitFailed(String),
+
+    #[error("synchronisation error: {0}")]
+    Sync(String),
+
+    #[error("synchronisation channel closed before the container reported readiness")]
+    SyncClosed,
+
     #[error("{0} is deliberately out of scope for mars")]
     OutOfScope(&'static str),
 
@@ -35,6 +56,13 @@ pub enum Error {
         context: String,
         #[source]
         source: std::io::Error,
+    },
+
+    #[error("{context}: {source}")]
+    Nix {
+        context: String,
+        #[source]
+        source: nix::Error,
     },
 
     #[error(transparent)]
@@ -56,6 +84,19 @@ pub trait IoContext<T> {
 impl<T> IoContext<T> for std::result::Result<T, std::io::Error> {
     fn ctx(self, context: impl Into<String>) -> Result<T> {
         self.map_err(|source| Error::Io {
+            context: context.into(),
+            source,
+        })
+    }
+}
+
+pub trait NixContext<T> {
+    fn ctx(self, context: impl Into<String>) -> Result<T>;
+}
+
+impl<T> NixContext<T> for std::result::Result<T, nix::Error> {
+    fn ctx(self, context: impl Into<String>) -> Result<T> {
+        self.map_err(|source| Error::Nix {
             context: context.into(),
             source,
         })

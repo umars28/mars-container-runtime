@@ -1,4 +1,5 @@
 pub mod list;
+pub mod run;
 pub mod spec;
 
 use crate::cli::{Cli, Command, Rootless};
@@ -33,7 +34,7 @@ pub fn dispatch(cli: Cli) -> Result<u8> {
 
         Command::Run(args) => {
             validate_id(&args.id)?;
-            Err(Error::Unimplemented("run"))
+            run::run(args)
         }
 
         Command::Exec(args) => {

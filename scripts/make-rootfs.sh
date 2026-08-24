@@ -15,21 +15,31 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+DOCKER=(docker)
+if ! docker info >/dev/null 2>&1; then
+  if sudo -n docker info >/dev/null 2>&1; then
+    DOCKER=(sudo docker)
+  else
+    echo "error: cannot reach the docker daemon as $(id -un) or via sudo" >&2
+    exit 1
+  fi
+fi
+
 if [[ -e "$OUT" ]]; then
   echo "error: $OUT already exists, remove it first" >&2
   exit 1
 fi
 
 cleanup() {
-  docker rm -f "$TMP_NAME" >/dev/null 2>&1 || true
+  "${DOCKER[@]}" rm -f "$TMP_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-docker pull -q "$IMAGE"
-docker create --name "$TMP_NAME" "$IMAGE" /bin/true >/dev/null
+"${DOCKER[@]}" pull -q "$IMAGE"
+"${DOCKER[@]}" create --name "$TMP_NAME" "$IMAGE" /bin/true >/dev/null
 
 mkdir -p "$OUT"
-docker export "$TMP_NAME" | tar -C "$OUT" -xf -
+"${DOCKER[@]}" export "$TMP_NAME" | tar -C "$OUT" -xf -
 
 echo "rootfs ready: $OUT ($(du -sh "$OUT" | cut -f1), $(find "$OUT" -type f | wc -l) files)"
 echo "next: mars spec --bundle $(dirname "$(readlink -f "$OUT")")"

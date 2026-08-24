@@ -2,7 +2,7 @@ use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, sigprocmask};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 const FORWARDED: [Signal; 7] = [
     Signal::SIGTERM,
@@ -31,6 +31,22 @@ pub fn unblock_all() -> Result<()> {
     Ok(())
 }
 
+pub fn parse(name: &str) -> Result<Signal> {
+    let trimmed = name.trim();
+
+    if let Ok(number) = trimmed.parse::<i32>() {
+        return Signal::try_from(number)
+            .map_err(|_| Error::Invalid(format!("{number} is not a signal number")));
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
+
+    Signal::iterator()
+        .find(|candidate| candidate.as_str().strip_prefix("SIG") == Some(bare))
+        .ok_or_else(|| Error::Invalid(format!("{name:?} is not a known signal")))
+}
+
 pub fn supervise(blocked: &SigSet, init: Pid) -> Result<u8> {
     loop {
         let signal = blocked.wait()?;
@@ -52,5 +68,31 @@ pub fn supervise(blocked: &SigSet, init: Pid) -> Result<u8> {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_accepted_with_or_without_the_sig_prefix() {
+        assert_eq!(parse("SIGTERM").unwrap(), Signal::SIGTERM);
+        assert_eq!(parse("TERM").unwrap(), Signal::SIGTERM);
+        assert_eq!(parse("term").unwrap(), Signal::SIGTERM);
+        assert_eq!(parse(" KILL ").unwrap(), Signal::SIGKILL);
+    }
+
+    #[test]
+    fn numbers_are_accepted_because_that_is_what_docker_sends() {
+        assert_eq!(parse("9").unwrap(), Signal::SIGKILL);
+        assert_eq!(parse("15").unwrap(), Signal::SIGTERM);
+    }
+
+    #[test]
+    fn nonsense_is_rejected_by_name() {
+        assert!(parse("SIGNOPE").is_err());
+        assert!(parse("0").is_err());
+        assert!(parse("999").is_err());
     }
 }

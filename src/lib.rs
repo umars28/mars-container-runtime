@@ -8,6 +8,7 @@ pub mod logging;
 pub mod namespace;
 pub mod paths;
 pub mod rootfs;
+pub mod state;
 pub mod sync;
 
 pub const OCI_VERSION: &str = "1.0.2";

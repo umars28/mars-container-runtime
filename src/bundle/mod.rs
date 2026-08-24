@@ -88,6 +88,41 @@ impl Bundle {
             .and_then(|linux| linux.cgroups_path().clone())
     }
 
+    pub fn hooks(&self) -> Option<&oci_spec::runtime::Hooks> {
+        self.spec.hooks().as_ref()
+    }
+
+    pub fn terminal(&self) -> bool {
+        self.spec
+            .process()
+            .as_ref()
+            .and_then(|process| process.terminal())
+            .unwrap_or(false)
+    }
+
+    pub fn process(&self) -> Option<&oci_spec::runtime::Process> {
+        self.spec.process().as_ref()
+    }
+
+    pub fn sysctl(&self) -> HashMap<String, String> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.sysctl().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn rootfs_propagation(&self) -> Option<&str> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.rootfs_propagation().as_deref())
+    }
+
+    pub fn domainname(&self) -> Option<&str> {
+        self.spec.domainname().as_deref()
+    }
+
     pub fn hostname(&self) -> Option<&str> {
         self.spec.hostname().as_deref()
     }
@@ -124,9 +159,15 @@ impl Bundle {
     }
 }
 
-pub fn resolve_executable(program: &str, env: &[String]) -> Result<PathBuf> {
+pub fn resolve_executable(program: &str, env: &[String], own_rootfs: bool) -> Result<PathBuf> {
     if program.contains('/') {
-        return Ok(PathBuf::from(program));
+        let path = PathBuf::from(program);
+
+        if own_rootfs && !path.is_file() {
+            return Err(Error::ExecutableNotFound(program.to_string()));
+        }
+
+        return Ok(path);
     }
 
     let search = env
@@ -156,20 +197,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absolute_program_is_returned_verbatim() {
-        let resolved = resolve_executable("/bin/sh", &[]).unwrap();
+    fn an_explicit_path_is_used_as_given_when_it_exists() {
+        let resolved = resolve_executable("/bin/sh", &[], true).unwrap();
         assert_eq!(resolved, PathBuf::from("/bin/sh"));
     }
 
     #[test]
-    fn relative_program_with_slash_is_not_searched() {
-        let resolved = resolve_executable("./run.sh", &[]).unwrap();
-        assert_eq!(resolved, PathBuf::from("./run.sh"));
+    fn an_explicit_path_that_does_not_exist_fails_here_rather_than_at_execve() {
+        let error = resolve_executable("/definitely/not/here", &[], true).unwrap_err();
+        assert!(matches!(error, Error::ExecutableNotFound(name) if name == "/definitely/not/here"));
+
+        let error = resolve_executable("./nope.sh", &[], true).unwrap_err();
+        assert!(matches!(error, Error::ExecutableNotFound(_)));
+    }
+
+    #[test]
+    fn a_joined_mount_namespace_is_not_ours_to_validate() {
+        let resolved = resolve_executable("/definitely/not/here", &[], false).unwrap();
+        assert_eq!(resolved, PathBuf::from("/definitely/not/here"));
     }
 
     #[test]
     fn missing_program_reports_the_name() {
-        let error = resolve_executable("definitely-not-a-real-binary", &[]).unwrap_err();
+        let error = resolve_executable("definitely-not-a-real-binary", &[], true).unwrap_err();
         assert!(
             matches!(error, Error::ExecutableNotFound(name) if name == "definitely-not-a-real-binary")
         );
@@ -178,7 +228,7 @@ mod tests {
     #[test]
     fn path_comes_from_spec_env_when_present() {
         let env = vec!["HOME=/root".to_string(), "PATH=/sbin:/bin".to_string()];
-        let error = resolve_executable("nope-not-here", &env).unwrap_err();
+        let error = resolve_executable("nope-not-here", &env, true).unwrap_err();
         assert!(matches!(error, Error::ExecutableNotFound(_)));
     }
 

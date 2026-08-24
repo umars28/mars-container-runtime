@@ -1,6 +1,8 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use nix::sys::stat::{Mode, SFlag, makedev, mknod};
+use nix::unistd::{Gid, Uid, chown};
 use oci_spec::runtime::{LinuxDevice, LinuxDeviceType};
 
 use crate::error::{IoContext, NixContext, Result};
@@ -90,6 +92,20 @@ pub fn create(rootfs: &Path, extra: &[LinuxDevice]) -> Result<()> {
             device.major() as u64,
             device.minor() as u64,
         )?;
+
+        if device.uid().is_some() || device.gid().is_some() {
+            chown(
+                &target,
+                device.uid().map(Uid::from_raw),
+                device.gid().map(Gid::from_raw),
+            )
+            .ctx(format!(
+                "chown {} to {:?}:{:?}",
+                target.display(),
+                device.uid(),
+                device.gid()
+            ))?;
+        }
     }
 
     Ok(())
@@ -122,5 +138,12 @@ fn node(target: &Path, kind: SFlag, mode: u32, major: u64, minor: u64) -> Result
         "mknod {} {:?} {major}:{minor}",
         target.display(),
         kind
+    ))?;
+
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode)).ctx(format!(
+        "chmod {} to {mode:04o}; mknod(2) masks its mode argument with the umask, so the node \
+         would otherwise get {:04o}",
+        target.display(),
+        mode & !0o022
     ))
 }

@@ -69,3 +69,30 @@ pub fn pivot(rootfs: &Path) -> Result<()> {
 
     Ok(())
 }
+
+pub fn set_propagation(requested: Option<&str>) -> Result<()> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+
+    let flag = match requested {
+        "shared" => MsFlags::MS_SHARED,
+        "slave" => MsFlags::MS_SLAVE,
+        "private" => MsFlags::MS_PRIVATE,
+        "unbindable" => MsFlags::MS_UNBINDABLE,
+        other => {
+            return Err(crate::error::Error::Invalid(format!(
+                "linux.rootfsPropagation {other:?} is not one of shared, slave, private, unbindable"
+            )));
+        }
+    };
+
+    mount(
+        None::<&Path>,
+        "/",
+        None::<&str>,
+        flag | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .ctx(format!("apply rootfsPropagation={requested} to /"))
+}

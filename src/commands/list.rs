@@ -1,54 +1,48 @@
-use std::fs;
-
 use crate::cli::{ListArgs, ListFormat};
-use crate::error::{IoContext, Result};
+use crate::error::Result;
 use crate::paths::Layout;
+use crate::state;
 
 pub fn run(layout: &Layout, args: &ListArgs) -> Result<()> {
-    let ids = collect(layout)?;
+    let containers = state::list(layout)?;
 
     if args.quiet {
-        for id in &ids {
-            println!("{id}");
+        for container in &containers {
+            println!("{}", container.id());
         }
         return Ok(());
     }
 
     match args.format {
         ListFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&ids)?);
+            let rows: Vec<_> = containers
+                .iter()
+                .map(|container| container.oci_state())
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         ListFormat::Table => {
-            let (h_id, h_pid, h_status, h_bundle) = ("ID", "PID", "STATUS", "BUNDLE");
-            println!("{h_id:<24}{h_pid:<8}{h_status:<12}{h_bundle}");
+            let (id, pid, status, bundle) = ("ID", "PID", "STATUS", "BUNDLE");
+            println!("{id:<24}{pid:<8}{status:<10}{bundle:<32}CREATED");
 
-            let unknown = "-";
-            for id in &ids {
-                println!("{id:<24}{unknown:<8}{unknown:<12}{unknown}");
+            for container in &containers {
+                let status = container.status();
+                let pid = match status {
+                    state::Status::Stopped => "0".to_string(),
+                    _ => container.state.pid.to_string(),
+                };
+
+                println!(
+                    "{:<24}{:<8}{:<10}{:<32}{}",
+                    container.id(),
+                    pid,
+                    status.to_string(),
+                    container.state.bundle.display(),
+                    container.state.created,
+                );
             }
         }
     }
 
     Ok(())
-}
-
-fn collect(layout: &Layout) -> Result<Vec<String>> {
-    if !layout.root().is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut ids = Vec::new();
-    let entries =
-        fs::read_dir(layout.root()).ctx(format!("read state root {}", layout.root().display()))?;
-
-    for entry in entries {
-        let entry = entry.ctx("read state root entry")?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if layout.exists(&name) {
-            ids.push(name);
-        }
-    }
-
-    ids.sort();
-    Ok(ids)
 }

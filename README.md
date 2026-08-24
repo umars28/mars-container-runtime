@@ -7,9 +7,11 @@ Kubernetes sit on top of, built to understand it rather than to replace it.
 a filesystem bundle and a `config.json`, then uses Linux namespaces, cgroup v2, and OverlayFS to
 turn it into an isolated process. The goal is to be a drop-in `--runtime` for Docker.
 
-> **Status: early.** `mars run` starts real isolated containers today, with namespaces, cgroup v2
-> resource limits, an OverlayFS rootfs assembled from image layers, device nodes, signal forwarding,
-> and exit code propagation. Still missing: the `create`/`start` split, seccomp, and rootless. See
+> **Status: early but usable.** The full OCI lifecycle works — `create`, `start`, `state`, `kill`,
+> `delete`, `exec`, `ps`, `pause`, `resume`, `events`, `update` — with namespaces, cgroup v2 limits,
+> an OverlayFS rootfs assembled from image layers, capabilities, the five lifecycle hooks, and a
+> console socket for `-it`. It ties `runc` on the OCI validation suite — 22 passed each, on the same
+> host and the same test binaries. Still missing: seccomp, rootless, and read-only paths. See
 > [Roadmap](#roadmap).
 
 ## Why build this when runc exists?
@@ -43,6 +45,19 @@ kernel silently cuts the `lowerdir=` list mid-path, then reports `ENOENT` on the
 error that names neither the truncation nor the layer count. This is why
 `/var/lib/docker/overlay2/l/` is full of short symlinks.
 
+The validation numbers are only meaningful next to a reference, so every run is paired with `runc`
+1.5.1 on the same host, same rootfs, same test binaries:
+
+| | passed | failed | inconclusive |
+|---|---|---|---|
+| mars 0.1.0 | 22 | 21 | 15 |
+| runc 1.5.1 | 22 | 20 | 16 |
+
+`runtime-tools` 0.9.0 is partly stale — both runtimes fail the same 15 tests for the same
+environmental reasons, written up per-test in [`docs/04-lifecycle.md`](docs/04-lifecycle.md#validation-results).
+Two of the rows where mars passes and runc does not are mars *ignoring* `mountLabel` and
+`apparmorProfile` rather than implementing them, which is noted there too.
+
 ## Design notes
 
 **The three-level fork chain is forced by the kernel, not a style choice.**
@@ -70,9 +85,10 @@ Two constraints produce that shape:
    parent and child need two-way synchronisation — a process cannot map itself.
 
 **Rust instead of Go, deliberately.** `runc` cannot call `setns(2)` reliably from Go, because Go is
-multi-threaded by the time `main` runs and namespaces are per-thread. It works around this with a C
-constructor (`libcontainer/nsenter`) that runs before the Go runtime starts. Rust stays
-single-threaded until we fork, so `unshare`/`setns` can be called directly.
+multi-threaded by the time `main` runs and `setns` refuses to move a multi-threaded process into a new
+mount or user namespace. It works around this with a C constructor (`libcontainer/nsenter`) that runs
+before the Go runtime starts. Rust stays single-threaded until we fork, so `mars exec` calls `setns`
+directly — and asserts the property rather than assuming it, by counting `/proc/self/task` first.
 
 **Telemetry lives only in the parent.** The OTLP exporter runs a background thread, and after
 `fork()` only async-signal-safe work is legal in the child. The child reports timings over a pipe;
@@ -111,8 +127,8 @@ networking, checkpoint/restore, CRI, cgroup v1, and the systemd cgroup driver.
 | 1 | Namespaces, `pivot_root`, PID 1 duties — [writeup](docs/01-isolation.md) | done |
 | 2 | cgroup v2 driver, OOMKilled reproduction — [writeup](docs/02-cgroups.md) | done |
 | 3 | OverlayFS rootfs, `config.json` validation — [writeup](docs/03-overlayfs.md) | done |
-| 4 | Full lifecycle, passes OCI validation | not started |
-| 5 | Capabilities, seccomp, rootless | not started |
+| 4 | Full lifecycle, `exec`, hooks, console, OCI validation — [writeup](docs/04-lifecycle.md) | done |
+| 5 | Seccomp, rootless, read-only paths | not started |
 | 6 | Docker drop-in, OpenTelemetry to Tempo | not started |
 | 7 | Per-phase writeups, CI | not started |
 

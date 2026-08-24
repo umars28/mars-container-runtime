@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use nix::unistd::Pid;
 use oci_spec::runtime::LinuxResources;
 
+use crate::cgroup::events;
 use crate::error::{Error, IoContext, Result};
 
 pub const MOUNT_POINT: &str = "/sys/fs/cgroup";
@@ -76,8 +77,57 @@ impl Cgroup {
         })
     }
 
+    pub fn attach(relative: &Path) -> Self {
+        Self {
+            path: Path::new(MOUNT_POINT).join(relative),
+            relative: relative.to_path_buf(),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn exists(&self) -> bool {
+        self.path.is_dir()
+    }
+
+    pub fn procs(&self) -> Result<Vec<Pid>> {
+        let text = self.read("cgroup.procs")?;
+
+        Ok(text
+            .lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .map(Pid::from_raw)
+            .collect())
+    }
+
+    pub fn freeze(&self, frozen: bool) -> Result<()> {
+        self.write("cgroup.freeze", if frozen { "1" } else { "0" })?;
+
+        for _ in 0..500 {
+            if self.is_frozen() == frozen {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        Err(Error::Invalid(format!(
+            "{} did not reach frozen={frozen} within 5s",
+            self.path.display()
+        )))
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.read("cgroup.events")
+            .map(|text| {
+                events::parse_flat_keyed(&text)
+                    .get("frozen")
+                    .copied()
+                    .unwrap_or(0)
+                    == 1
+            })
+            .unwrap_or(false)
     }
 
     pub fn relative(&self) -> &Path {

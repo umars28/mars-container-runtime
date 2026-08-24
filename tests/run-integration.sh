@@ -114,6 +114,11 @@ rejects() {
   fi
 }
 
+echo "clearing any state left by an earlier run"
+for id in $("$MARS" list -q 2>/dev/null); do "$MARS" delete --force "$id" 2>/dev/null; done
+find /sys/fs/cgroup/mars -mindepth 1 -maxdepth 1 -type d -exec rmdir {} + 2>/dev/null
+rm -rf /run/mars
+
 echo "preparing shared rootfs from $IMAGE"
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -252,10 +257,10 @@ if await_init "$WORK/cg.pid"; then
   kill -KILL "$init_pid"
   wait "$runtime_pid"
 
-  if [[ ! -d /sys/fs/cgroup/mars ]]; then
-    ok "cgroup tree removed when the container exits"
+  if [[ ! -d "$cg" ]]; then
+    ok "the container cgroup is removed when it exits"
   else
-    no "cgroup tree removed when the container exits" "gone" "$(ls /sys/fs/cgroup/mars)"
+    no "the container cgroup is removed when it exits" "gone" "$(ls "$cg")"
   fi
 else
   no "pid file written by the runtime" "a pid" "nothing"
@@ -436,6 +441,280 @@ rejects "a single-layer read-only overlay is named as such" "$WORK/ovlone" "at l
 overlay_bundle "$WORK/ovlnons" "$LOWER/top:$LOWER/base" \
   '.process.args = ["/bin/true"] | .linux.namespaces = [{"type":"pid"}] | del(.hostname)'
 rejects "an overlay without a mount namespace is refused" "$WORK/ovlnons" "mount namespace"
+
+echo
+echo "the create/start split: create parks the init, start releases it"
+ROOT="$WORK/root"
+rm -rf "$ROOT"
+M=("$MARS" --root "$ROOT")
+bundle "$WORK/lc" '.process.args = ["/bin/sh","-c","echo started > /ran.txt; sleep 30"]'
+
+env -C "$WORK/lc" "${M[@]}" create lc
+check "create returns without starting the process" "0" "$?"
+check "state is created, not running" "created" "$(env -C "$WORK/lc" "${M[@]}" state lc | jq -r .status)"
+check "the user process has not run yet" "1" "$(
+  test -f "$WORK/lc/rootfs/ran.txt"
+  echo $?
+)"
+if [[ -p "$ROOT/lc/exec.fifo" ]]; then
+  ok "the exec fifo exists and is a fifo"
+else
+  no "the exec fifo exists" "a fifo" "$(ls -l "$ROOT/lc/exec.fifo" 2>&1)"
+fi
+check "state.json records the pid" "$(cat "$ROOT/lc/init.pid" 2>/dev/null || jq -r .pid "$ROOT/lc/state.json")" \
+  "$(jq -r .pid "$ROOT/lc/state.json")"
+
+"${M[@]}" start lc
+sleep 0.4
+check "state is running after start" "running" "$("${M[@]}" state lc | jq -r .status)"
+check "the user process ran" "started" "$(cat "$WORK/lc/rootfs/ran.txt" 2>/dev/null)"
+check "the exec fifo is gone, so start cannot run twice" "1" "$(
+  test -e "$ROOT/lc/exec.fifo"
+  echo $?
+)"
+"${M[@]}" start lc 2>/dev/null
+check "starting an already-started container is refused" "1" "$?"
+
+echo
+echo "state is derived from the kernel, not from what the runtime wrote down"
+init_pid=$(jq -r .pid "$ROOT/lc/state.json")
+check "state reports the OCI shape" "1.0.2 lc running" \
+  "$("${M[@]}" state lc | jq -r '"\(.ociVersion) \(.id) \(.status)"')"
+check "list shows the container" "1" "$("${M[@]}" list -q | grep -c '^lc$')"
+kill -KILL "$init_pid"
+sleep 0.4
+check "status becomes stopped once the pid is gone" "stopped" "$("${M[@]}" state lc | jq -r .status)"
+check "a stopped container reports no pid" "null" "$("${M[@]}" state lc | jq -r '.pid // "null"')"
+
+echo
+echo "delete refuses a live container and cleans up a dead one"
+"${M[@]}" delete lc
+check "delete removes a stopped container" "0" "$?"
+check "the state directory is gone" "1" "$(
+  test -d "$ROOT/lc"
+  echo $?
+)"
+
+bundle "$WORK/force" '.process.args = ["/bin/sleep","30"]'
+env -C "$WORK/force" "${M[@]}" create force
+"${M[@]}" start force
+sleep 0.3
+"${M[@]}" delete force 2>/dev/null
+check "delete refuses a running container" "1" "$?"
+"${M[@]}" delete --force force
+check "delete --force kills it first" "0" "$?"
+check "the cgroup is gone after delete" "1" "$(
+  test -d /sys/fs/cgroup/mars/force
+  echo $?
+)"
+
+echo
+echo "kill takes signal names and numbers, and refuses a stopped container"
+bundle "$WORK/sig" '.process.args = ["/bin/sh","-c","trap \"exit 42\" USR1; while true; do sleep 0.2; done"]'
+env -C "$WORK/sig" "${M[@]}" create sig
+"${M[@]}" start sig
+sleep 0.4
+"${M[@]}" kill sig USR1
+check "kill by bare name works" "0" "$?"
+sleep 0.5
+check "the container acted on the signal" "stopped" "$("${M[@]}" state sig | jq -r .status)"
+"${M[@]}" kill sig 9 2>/dev/null
+check "kill on a stopped container is refused" "1" "$?"
+"${M[@]}" delete sig
+
+echo
+echo "pause and resume use cgroup.freeze"
+bundle "$WORK/frz" '.process.args = ["/bin/sleep","30"]'
+env -C "$WORK/frz" "${M[@]}" create frz
+"${M[@]}" start frz
+sleep 0.3
+"${M[@]}" pause frz
+check "status is paused" "paused" "$("${M[@]}" state frz | jq -r .status)"
+check "the kernel agrees the cgroup is frozen" "frozen 1" \
+  "$(grep '^frozen' /sys/fs/cgroup/mars/frz/cgroup.events)"
+"${M[@]}" resume frz
+check "status is running again" "running" "$("${M[@]}" state frz | jq -r .status)"
+"${M[@]}" delete --force frz
+
+echo
+echo "exec joins the running container's namespaces"
+bundle "$WORK/ex" '.process.args = ["/bin/sleep","30"]'
+env -C "$WORK/ex" "${M[@]}" create ex
+"${M[@]}" start ex
+sleep 0.4
+init_pid=$("${M[@]}" state ex | jq -r .pid)
+
+mapfile -t ex < <("${M[@]}" exec ex -- /bin/sh -c 'echo $$; hostname; cat /proc/self/cgroup; cat /etc/alpine-release')
+check "the exec process is inside the container pid namespace" "2" "${ex[0]:-<none>}"
+check "it sees the container hostname" "mars" "${ex[1]:-<none>}"
+check "it sees the container cgroup as its root" "0::/" "${ex[2]:-<none>}"
+check_prefix "it sees the container rootfs" "3.20" "${ex[3]:-<none>}"
+
+check "the namespaces really are the container's" "0" "$(
+  a=$(readlink "/proc/$init_pid/ns/mnt")
+  b=$("${M[@]}" exec ex -- /bin/sh -c 'readlink /proc/self/ns/mnt')
+  [[ "$a" == "$b" ]]
+  echo $?
+)"
+
+"${M[@]}" exec ex -- /bin/sh -c 'exit 42'
+check "the exec exit code propagates" "42" "$?"
+check "--env and --cwd are honoured" "/etc bar" \
+  "$("${M[@]}" exec ex -e FOO=bar --cwd /etc -- /bin/sh -c 'echo $(pwd) $FOO')"
+
+rm -f "$WORK/ex.pid"
+"${M[@]}" exec -d --pid-file "$WORK/ex.pid" ex -- /bin/sleep 5
+sleep 0.4
+exec_pid=$(cat "$WORK/ex.pid" 2>/dev/null)
+check "the exec pid file lands on the host, not in the container" "0" "$(
+  test -n "$exec_pid"
+  echo $?
+)"
+check "the exec process joined the container cgroup" "1" \
+  "$(grep -c "^${exec_pid:-none}$" /sys/fs/cgroup/mars/ex/cgroup.procs)"
+check "the runtime itself did not join the cgroup" "2" \
+  "$(wc -l < /sys/fs/cgroup/mars/ex/cgroup.procs)"
+
+"${M[@]}" delete --force ex
+"${M[@]}" exec ex -- /bin/true 2>/dev/null
+check "exec into a deleted container is refused" "1" "$?"
+
+echo
+echo "ps and events read the cgroup"
+bundle "$WORK/ps" '.process.args = ["/bin/sleep","30"]'
+env -C "$WORK/ps" "${M[@]}" create ps1
+"${M[@]}" start ps1
+sleep 0.3
+check "ps -f json lists the init pid" "1" \
+  "$("${M[@]}" ps ps1 -f json | jq 'length')"
+check "events --stats reports a pid count" "1" \
+  "$("${M[@]}" events --stats ps1 | jq '.data.pids.current')"
+"${M[@]}" delete --force ps1
+
+echo
+echo "process.user, rlimits and oomScoreAdj are applied"
+bundle "$WORK/usr" '.process.args = ["/bin/sh","-c","id -u; id -g; ulimit -n; cat /proc/self/oom_score_adj"]
+  | .process.user.uid = 405
+  | .process.user.gid = 100
+  | .process.rlimits = [{"type":"RLIMIT_NOFILE","hard":512,"soft":512}]
+  | .process.oomScoreAdj = 123'
+mapfile -t usr < <(run_in "$WORK/usr" usr)
+check "uid is the one the spec asked for" "405" "${usr[0]:-<none>}"
+check "gid is the one the spec asked for" "100" "${usr[1]:-<none>}"
+check "RLIMIT_NOFILE was applied" "512" "${usr[2]:-<none>}"
+check "oom_score_adj was applied" "123" "${usr[3]:-<none>}"
+
+echo
+echo "capabilities are reduced to the set in the spec"
+bundle "$WORK/cap" '.process.args = ["/bin/sh","-c","grep CapEff /proc/self/status; grep CapBnd /proc/self/status"]
+  | .process.capabilities.bounding = ["CAP_KILL","CAP_CHOWN"]
+  | .process.capabilities.effective = ["CAP_KILL"]
+  | .process.capabilities.permitted = ["CAP_KILL"]
+  | .process.capabilities.inheritable = []
+  | .process.capabilities.ambient = []'
+mapfile -t cap < <(run_in "$WORK/cap" cap)
+check "the effective set is exactly CAP_KILL" "CapEff:	0000000000000020" "${cap[0]:-<none>}"
+check "the bounding set is exactly CAP_KILL and CAP_CHOWN" "CapBnd:	0000000000000021" "${cap[1]:-<none>}"
+
+echo
+echo "the five lifecycle hooks run where the spec says they do"
+HOOK="$WORK/hook.sh"
+cat >"$HOOK" <<'HOOKEOF'
+#!/bin/sh
+state=$(cat)
+id=$(echo "$state" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+status=$(echo "$state" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+printf '%s id=%s status=%s uts=%s alpine=%s\n' \
+  "$1" "$id" "$status" "$(readlink /proc/self/ns/uts)" \
+  "$(test -f /etc/alpine-release && echo yes || echo no)" >>"$HOOKLOG"
+HOOKEOF
+chmod +x "$HOOK"
+HOOKLOG="$WORK/hooks.log"
+export HOOKLOG
+rm -f "$HOOKLOG"
+
+bundle "$WORK/hk" '.process.args = ["/bin/true"]'
+jq --arg hook "$HOOK" --arg log "$HOOKLOG" \
+  '.hooks.createRuntime   = [{"path":$hook,"args":["h","createRuntime"],  "env":["HOOKLOG=\($log)"]}]
+   | .hooks.createContainer = [{"path":$hook,"args":["h","createContainer"],"env":["HOOKLOG=\($log)"]}]
+   | .hooks.poststart       = [{"path":$hook,"args":["h","poststart"],      "env":["HOOKLOG=\($log)"]}]
+   | .hooks.poststop        = [{"path":$hook,"args":["h","poststop"],       "env":["HOOKLOG=\($log)"]}]
+   | .hooks.startContainer  = [{"path":"/bin/sh","args":["sh","-c","cat /etc/alpine-release > /startContainer.txt"]}]' \
+  "$WORK/hk/config.json" >"$WORK/hk/c.tmp"
+mv "$WORK/hk/c.tmp" "$WORK/hk/config.json"
+
+HOST_UTS=$(readlink /proc/self/ns/uts)
+run_in "$WORK/hk" hk
+check "the container ran with hooks configured" "0" "$?"
+
+check "four host-side hooks ran, in order" "createRuntime createContainer poststart poststop" \
+  "$(awk '{print $1}' "$HOOKLOG" | tr '\n' ' ' | sed 's/ $//')"
+check "createRuntime runs in the runtime's UTS namespace" "uts=$HOST_UTS" \
+  "$(awk '/^createRuntime/ {print $4}' "$HOOKLOG")"
+if [[ "$(awk '/^createContainer/ {print $4}' "$HOOKLOG")" != "uts=$HOST_UTS" ]]; then
+  ok "createContainer runs in the container's UTS namespace"
+else
+  no "createContainer runs in the container's namespaces" "a different uts ns" "$HOST_UTS"
+fi
+check "createContainer runs before pivot_root, so the rootfs is still the host's" "alpine=no" \
+  "$(awk '/^createContainer/ {print $5}' "$HOOKLOG")"
+check_prefix "startContainer runs after pivot_root, inside the container rootfs" "3.20" \
+  "$(cat "$WORK/hk/rootfs/startContainer.txt" 2>/dev/null)"
+check "poststart sees the container running" "status=running" \
+  "$(awk '/^poststart/ {print $3}' "$HOOKLOG")"
+check "poststop sees it stopped" "status=stopped" \
+  "$(awk '/^poststop/ {print $3}' "$HOOKLOG")"
+
+bundle "$WORK/hkfail" '.process.args = ["/bin/true"]'
+jq --arg hook /bin/false '.hooks.createRuntime = [{"path":$hook,"args":["false"]}]' \
+  "$WORK/hkfail/config.json" >"$WORK/hkfail/c.tmp"
+mv "$WORK/hkfail/c.tmp" "$WORK/hkfail/config.json"
+rejects "a failing createRuntime hook aborts create" "$WORK/hkfail" "createRuntime hook 0"
+
+bundle "$WORK/hkpost" '.process.args = ["/bin/true"]'
+jq --arg hook /bin/false '.hooks.poststop = [{"path":$hook,"args":["false"]}]' \
+  "$WORK/hkpost/config.json" >"$WORK/hkpost/c.tmp"
+mv "$WORK/hkpost/c.tmp" "$WORK/hkpost/config.json"
+run_in "$WORK/hkpost" hkpost >/dev/null 2>&1
+check "a failing poststop hook does not fail the operation" "0" "$?"
+
+echo
+echo "a console socket receives the pty master over SCM_RIGHTS"
+if command -v python3 >/dev/null; then
+  bundle "$WORK/tty" '.process.args = ["/bin/sh","-c","tty; test -t 1 && echo stdout-is-a-tty"]'
+  jq '.process.terminal = true' "$WORK/tty/config.json" >"$WORK/tty/c.tmp"
+  mv "$WORK/tty/c.tmp" "$WORK/tty/config.json"
+
+  rm -f "$WORK/tty.out"
+  python3 "$(dirname "$0")/recvtty.py" "$WORK/console.sock" "$WORK/tty.out" >/dev/null 2>&1 &
+  receiver=$!
+  sleep 1
+  env -C "$WORK/tty" "${M[@]}" run -d --console-socket "$WORK/console.sock" ttytest >/dev/null 2>&1
+  sleep 1.5
+  wait "$receiver" 2>/dev/null
+  tty_out=$(tr -d '\r' <"$WORK/tty.out" 2>/dev/null)
+  check "the container's stdin names a pty inside its own devpts" "/dev/pts/0" \
+    "$(sed -n 1p <<<"$tty_out")"
+  check "stdout is a terminal" "stdout-is-a-tty" "$(sed -n 2p <<<"$tty_out")"
+  "${M[@]}" delete --force ttytest 2>/dev/null
+else
+  no "console socket test" "python3" "not installed"
+fi
+
+echo
+echo "a create that cannot work fails at create and leaves nothing behind"
+bundle "$WORK/nobin" '.process.args = ["/nonexistent-binary"]'
+before=$(find /sys/fs/cgroup/mars -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+out=$(env -C "$WORK/nobin" "${M[@]}" create nobin 2>&1)
+status=$?
+check "create fails rather than deferring the error to start" "1" "$status"
+check_error "the missing executable is named" "not found in the container PATH" "$out"
+check "no cgroup is left behind" "$before" \
+  "$(find /sys/fs/cgroup/mars -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+check "no state directory is left behind" "1" "$(
+  test -d "$ROOT/nobin"
+  echo $?
+)"
 
 echo
 echo "$PASS passed, $FAIL failed"

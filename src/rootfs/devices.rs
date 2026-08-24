@@ -1,11 +1,12 @@
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use nix::errno::Errno;
 use nix::sys::stat::{Mode, SFlag, makedev, mknod};
 use nix::unistd::{Gid, Uid, chown};
 use oci_spec::runtime::{LinuxDevice, LinuxDeviceType};
 
-use crate::error::{IoContext, NixContext, Result};
+use crate::error::{Error, IoContext, NixContext, Result};
 
 struct DefaultDevice {
     path: &'static str,
@@ -60,14 +61,16 @@ const SYMLINKS: [(&str, &str); 4] = [
     ("/proc/self/fd/2", "dev/stderr"),
 ];
 
-pub fn create(rootfs: &Path, extra: &[LinuxDevice]) -> Result<()> {
+pub fn create(rootfs: &Path, extra: &[LinuxDevice], user_namespace: bool) -> Result<()> {
     for device in DEFAULT_DEVICES {
         node(
             &rootfs.join(device.path),
+            Path::new("/").join(device.path),
             SFlag::S_IFCHR,
             device.mode,
             device.major,
             device.minor,
+            user_namespace,
         )?;
     }
 
@@ -87,10 +90,12 @@ pub fn create(rootfs: &Path, extra: &[LinuxDevice]) -> Result<()> {
 
         node(
             &target,
+            device.path().clone(),
             sflag_for(device.typ()),
             device.file_mode().unwrap_or(0o666),
             device.major() as u64,
             device.minor() as u64,
+            user_namespace,
         )?;
 
         if device.uid().is_some() || device.gid().is_some() {
@@ -119,7 +124,15 @@ fn sflag_for(kind: LinuxDeviceType) -> SFlag {
     }
 }
 
-fn node(target: &Path, kind: SFlag, mode: u32, major: u64, minor: u64) -> Result<()> {
+fn node(
+    target: &Path,
+    host: PathBuf,
+    kind: SFlag,
+    mode: u32,
+    major: u64,
+    minor: u64,
+    user_namespace: bool,
+) -> Result<()> {
     if target.symlink_metadata().is_ok() {
         return Ok(());
     }
@@ -128,22 +141,59 @@ fn node(target: &Path, kind: SFlag, mode: u32, major: u64, minor: u64) -> Result
         std::fs::create_dir_all(parent).ctx(format!("create {}", parent.display()))?;
     }
 
-    mknod(
+    if user_namespace {
+        return bind(target, &host);
+    }
+
+    match mknod(
         target,
         kind,
         Mode::from_bits_truncate(mode),
         makedev(major, minor),
-    )
-    .ctx(format!(
-        "mknod {} {:?} {major}:{minor}",
-        target.display(),
-        kind
-    ))?;
+    ) {
+        Ok(()) => {}
+        Err(Errno::EPERM | Errno::EOVERFLOW) => return bind(target, &host),
+        Err(source) => {
+            return Err(Error::Nix {
+                context: format!("mknod {} {kind:?} {major}:{minor}", target.display()),
+                source,
+            });
+        }
+    }
 
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode)).ctx(format!(
         "chmod {} to {mode:04o}; mknod(2) masks its mode argument with the umask, so the node \
          would otherwise get {:04o}",
         target.display(),
         mode & !0o022
+    ))
+}
+
+fn bind(target: &Path, host: &Path) -> Result<()> {
+    if !host.exists() {
+        return Err(Error::Invalid(format!(
+            "cannot provide {} because the host has no {}",
+            target.display(),
+            host.display()
+        )));
+    }
+
+    if !target.exists() {
+        std::fs::File::create(target)
+            .ctx(format!("create {} as a bind target", target.display()))?;
+    }
+
+    nix::mount::mount(
+        Some(host),
+        target,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .ctx(format!(
+        "bind {} onto {}; a user namespace may not call mknod(2) for a device at all, so the node \
+         has to come from the host",
+        host.display(),
+        target.display()
     ))
 }

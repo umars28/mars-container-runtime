@@ -5,6 +5,8 @@ use oci_spec::runtime::{LinuxNamespace, LinuxNamespaceType};
 
 use crate::error::{Error, Result};
 
+pub const CLONE_NEWTIME: libc::c_int = 0x0000_0080;
+
 pub const JOIN_ORDER: [LinuxNamespaceType; 7] = [
     LinuxNamespaceType::User,
     LinuxNamespaceType::Ipc,
@@ -57,6 +59,10 @@ pub fn clone_flags(namespaces: &[LinuxNamespace]) -> Result<CloneFlags> {
     Ok(layout(namespaces)?.create)
 }
 
+pub fn without(flags: CloneFlags, unwanted: CloneFlags) -> CloneFlags {
+    CloneFlags::from_bits_retain(flags.bits() & !unwanted.bits())
+}
+
 pub fn flag_for(kind: LinuxNamespaceType) -> Result<CloneFlags> {
     Ok(match kind {
         LinuxNamespaceType::Mount => CloneFlags::CLONE_NEWNS,
@@ -66,7 +72,7 @@ pub fn flag_for(kind: LinuxNamespaceType) -> Result<CloneFlags> {
         LinuxNamespaceType::Uts => CloneFlags::CLONE_NEWUTS,
         LinuxNamespaceType::User => CloneFlags::CLONE_NEWUSER,
         LinuxNamespaceType::Cgroup => CloneFlags::CLONE_NEWCGROUP,
-        LinuxNamespaceType::Time => return Err(Error::OutOfScope("time namespace")),
+        LinuxNamespaceType::Time => CloneFlags::from_bits_retain(CLONE_NEWTIME),
     })
 }
 
@@ -154,7 +160,45 @@ mod tests {
     }
 
     #[test]
-    fn the_time_namespace_stays_out_of_scope() {
-        assert!(layout(&[namespace(LinuxNamespaceType::Time, None)]).is_err());
+    fn the_time_namespace_is_supported_because_docker_asks_for_one() {
+        let found = layout(&[namespace(LinuxNamespaceType::Time, None)]).unwrap();
+        assert_eq!(found.create.bits(), CLONE_NEWTIME);
+    }
+
+    #[test]
+    fn removing_a_flag_keeps_bits_the_nix_bindings_do_not_know() {
+        let requested = layout(&[
+            namespace(LinuxNamespaceType::Time, None),
+            namespace(LinuxNamespaceType::Cgroup, None),
+            namespace(LinuxNamespaceType::Pid, None),
+        ])
+        .unwrap()
+        .create;
+
+        let kept = without(requested, CloneFlags::CLONE_NEWCGROUP);
+
+        assert!(!kept.contains(CloneFlags::CLONE_NEWCGROUP));
+        assert!(kept.contains(CloneFlags::CLONE_NEWPID));
+        assert_eq!(
+            kept.bits() & CLONE_NEWTIME,
+            CLONE_NEWTIME,
+            "CLONE_NEWTIME is not one of nix's named flags, so `flags & !other` would drop it"
+        );
+
+        let naive = requested & !CloneFlags::CLONE_NEWCGROUP;
+        assert_eq!(
+            naive.bits() & CLONE_NEWTIME,
+            0,
+            "this is the trap the helper exists to avoid"
+        );
+    }
+
+    #[test]
+    fn the_time_namespace_flag_matches_the_kernels_clone_newtime() {
+        assert_eq!(CLONE_NEWTIME, 0x80);
+        assert_eq!(
+            flag_for(LinuxNamespaceType::Time).unwrap().bits(),
+            LinuxNamespaceType::Time as i32
+        );
     }
 }

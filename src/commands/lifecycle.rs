@@ -10,13 +10,21 @@ use crate::container::{self, CreateOptions, exec::ExecOptions, signal};
 use crate::error::{Error, IoContext, Result};
 use crate::paths::Layout;
 use crate::state::Container;
+use crate::telemetry;
 
-pub fn create(layout: &Layout, args: &CreateArgs, rootless: bool) -> Result<()> {
+pub fn create(
+    layout: &Layout,
+    args: &CreateArgs,
+    rootless: bool,
+    otlp: Option<&str>,
+) -> Result<()> {
     reject_unsupported(args.preserve_fds, args.no_pivot)?;
 
+    let mut clock = telemetry::Recorder::new();
+    clock.begin("bundle");
     let bundle = Bundle::load(&args.bundle)?;
 
-    container::create(
+    let outcome = container::create(
         layout,
         &bundle,
         &CreateOptions {
@@ -25,12 +33,30 @@ pub fn create(layout: &Layout, args: &CreateArgs, rootless: bool) -> Result<()> 
             console_socket: args.console_socket.clone(),
             rootless,
         },
-    )
+        &mut clock,
+    );
+
+    trace(otlp, "container.create", &args.id, &mut clock);
+
+    outcome
 }
 
-pub fn run(layout: &Layout, args: &RunArgs, rootless: bool) -> Result<u8> {
+fn trace(otlp: Option<&str>, root: &str, id: &str, clock: &mut telemetry::Recorder) {
+    let Some(endpoint) = telemetry::endpoint(otlp) else {
+        clock.end();
+        return;
+    };
+
+    if let Err(error) = telemetry::export(&endpoint, root, id, clock) {
+        tracing::warn!("could not export the startup trace: {error}");
+    }
+}
+
+pub fn run(layout: &Layout, args: &RunArgs, rootless: bool, otlp: Option<&str>) -> Result<u8> {
     reject_unsupported(args.preserve_fds, args.no_pivot)?;
 
+    let mut clock = telemetry::Recorder::new();
+    clock.begin("bundle");
     let bundle = Bundle::load(&args.bundle)?;
 
     container::run(
@@ -44,6 +70,8 @@ pub fn run(layout: &Layout, args: &RunArgs, rootless: bool) -> Result<u8> {
         },
         args.detach,
         args.keep,
+        &mut clock,
+        &|clock| trace(otlp, "container.run", &args.id, clock),
     )
 }
 

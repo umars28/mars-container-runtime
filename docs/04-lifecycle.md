@@ -315,7 +315,9 @@ Where the two runtimes differ:
 | `linux_masked_paths`, `linux_readonly_paths`, `root_readonly_true` | fail | pass | phase 5 |
 | `linux_ns_nopath`, `linux_uid_mappings` | fail | pass | user namespaces, phase 5 |
 
-Every remaining mars-only failure is a phase 5 item. Two rows deserve a caveat rather than credit:
+Every remaining mars-only failure is a phase 5 item, and
+[phase 5](05-hardening.md#validation-results) closes all of them. Two rows deserve a caveat rather
+than credit:
 `mars` accepts `mountLabel` and `apparmorProfile` and does nothing with them, while `runc` tries and
 fails on a host with no SELinux or AppArmor policy loaded. Passing by ignoring a field is not passing.
 
@@ -339,6 +341,7 @@ not one it set up — and `linux_ns_path` exercises exactly that, joining a name
 
 ## Not yet done
 
+Seccomp, read-only paths and user namespaces land in [phase 5](05-hardening.md);
 `--preserve-fds` and `--no-pivot` are still rejected outright. `linux.devices` cgroup rules (the
 device allowlist) need eBPF on cgroup v2 and are not implemented, which is why the
 `linux_cgroups_devices` test fails — `runc` fails it here too.

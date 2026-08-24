@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install libseccomp headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libseccomp-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test --lib
+
+  integration:
+    name: integration suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libseccomp-dev pkg-config jq attr uidmap
+
+      - name: confirm the host is a pure cgroup v2 hierarchy
+        run: |
+          stat -fc %T /sys/fs/cgroup
+          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+          cat /sys/fs/cgroup/cgroup.controllers
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build
+
+      - name: delegate the controllers the suite needs
+        run: |
+          for c in cpu cpuset io memory pids; do
+            grep -qw "$c" /sys/fs/cgroup/cgroup.controllers || continue
+            echo "+$c" | sudo tee -a /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+          done
+          cat /sys/fs/cgroup/cgroup.subtree_control
+
+      - name: run the integration suite
+        run: sudo -E env MARS=target/debug/mars ./tests/run-integration.sh
+
+  validation:
+    name: OCI validation, next to runc
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libseccomp-dev pkg-config jq
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - run: cargo build --release
+      - run: sudo install -m 0755 target/release/mars /usr/local/bin/mars
+
+      - name: build the runtime-tools suite
+        run: |
+          git clone --depth 1 https://github.com/opencontainers/runtime-tools.git /tmp/runtime-tools
+          cd /tmp/runtime-tools
+          make runtimetest validation-executables
+
+      - name: build a rootfs for the suite
+        run: |
+          docker create --name rootfs alpine:3.20 /bin/true
+          mkdir -p /tmp/rootfs
+          docker export rootfs | tar -C /tmp/rootfs -xf -
+          docker rm rootfs
+          tar czf "/tmp/runtime-tools/rootfs-$(go env GOARCH).tar.gz" -C /tmp/rootfs .
+
+      - name: mars
+        run: sudo -E env TOOLS=/tmp/runtime-tools ./scripts/run-validation.sh || true
+
+      - name: runc, for comparison
+        run: |
+          sudo -E env TOOLS=/tmp/runtime-tools RUNTIME=runc ./scripts/run-validation.sh || true

@@ -411,6 +411,101 @@ handed to the kernel to cut in half.
 
 ---
 
+## `permission denied` on a volume at mode `0777`
+
+**Symptom in production.** A rootless container — Podman, or Docker in rootless mode, or anything
+running under a user namespace — cannot write to a bind-mounted host directory. `chmod 777` on the
+host does not help. `ls -l` inside the container shows the files owned by `nobody`, and the numbers
+do not match anything in `/etc/passwd`.
+
+**Reproduction.** A container in a user namespace mapping container 0..65535 onto host
+100000..165535, looking at a device node that belongs to host root:
+
+```sh
+$ mars run uns
+0                              # id -u: root, as far as the container knows
+         0     100000      65536
+$ stat -c %u /dev/null         # inside the container
+65534
+```
+
+`65534` is the **overflow uid** — `/proc/sys/kernel/overflowuid`. It is what the kernel shows when a
+file's owner has no mapping in the calling process's user namespace. Host uid 0 is not inside
+`[100000, 165536)`, so root-owned files have no name inside the container at all.
+
+**Cause.** File ownership is stored as a number, and a user namespace changes what that number
+*means*. The container's uid 0 is host uid 100000. A file owned by host uid 0 maps to nothing, so it
+reads as `nobody`, and the container's root — which is host 100000 — has only "other" permissions on
+it.
+
+`chmod 777` does work, for that reason. What usually does not work is `chmod 755`, which is what
+people actually try, and what makes this look like a permission bug rather than a mapping one.
+
+Three things follow:
+
+1. **The fix is ownership, not mode.** `chown 100000:100000` on the host, or `podman unshare chown 0:0`
+   which does the same arithmetic for you. Newer kernels can do it per-mount with an idmapped mount
+   (`mount_setattr` with `MOUNT_ATTR_IDMAP`), which is what `mounts[].uidMappings` in the runtime-spec
+   is for.
+2. **`nobody` in `ls -l` is the diagnostic.** If a rootless container shows `nobody` on files you own,
+   you are looking at an unmapped id, not a broken ACL.
+3. **The same rule breaks the runtime itself**, one step earlier. `mkdir` inside the rootfs failed with
+   `EOVERFLOW` before any container started, because the *runtime's own* uid was unmapped — see
+   [phase 5](05-hardening.md#a-user-namespace-makes-you-nobody-first). Same mechanism, different victim.
+
+---
+
+## Starting a container is slow, and nothing in the image is to blame
+
+**Symptom in production.** Short-lived containers have a floor on startup latency that image size and
+registry caching do not move. A CI job that runs a hundred one-second containers spends a visible
+fraction of its wall clock somewhere unaccounted for. Kubernetes pod startup has a similar floor.
+
+**Reproduction.** Trace the runtime's own startup path — `mars` exports one span per phase over OTLP:
+
+```
+trace 10a2ae966c82f09af3c6d2282991b79c  25 spans  11892us total
+     458us    279us  cgroup             ← create the cgroup, write every limit
+    1012us    895us  intermediate.unshare.net
+    2358us   7065us  cgroup.attach      ← write one pid to cgroup.procs
+    9438us    492us  init.rootfs.mount
+    9931us    232us  init.pivot_root
+```
+
+Across three runs `cgroup.attach` was 6.6ms, 9.5ms and 14.7ms of totals of 11.9ms, 14.2ms and
+18.5ms — **55% to 79% of cold start, to write one number to one file.**
+
+Measured on its own, moving the same process in and out of a freshly created cgroup:
+
+```
+  move into a new cgroup: 11268us     ← first migration
+  move back to root:        770us
+  move into the same one:   702us     ← second migration
+  move back to root:        639us
+  move into the same one:   615us
+```
+
+**Cause.** The first process migration into a newly created cgroup pays a one-time cost the later ones
+do not: the kernel allocating and initialising per-cgroup controller state, and taking
+`cgroup_threadgroup_rwsem` as a writer, which needs an RCU grace period across every CPU. Roughly
+11ms here, then ~650µs for every migration after it.
+
+Which is precisely the wrong shape for containers, because **every container gets a fresh cgroup**, so
+every container pays the first-touch cost and nothing is ever amortised.
+
+The practical consequences:
+
+- Nothing about the *image* is involved. Assembling the rootfs, `pivot_root`, masking paths and
+  loading the seccomp filter came to under 900µs combined — two orders of magnitude below the cgroup
+  migration.
+- The runner-up is `unshare(CLONE_NEWNET)` at ~900µs, ten times any other namespace, because the
+  kernel builds a whole network stack: a fresh loopback device, routing tables, per-namespace state.
+  That is the mechanism behind `--network=host` making short-lived containers measurably faster.
+- If you are chasing container startup latency, measure before optimising. I assumed the 7ms was an
+  instrumentation bug, which is why the standalone measurement above exists.
+
+---
+
 ## Still to come
 
-- `permission denied` on a mount at mode `0777`, caused by user namespace uid remapping (phase 5)
+- nothing outstanding; the remaining gaps are listed per phase in the writeups

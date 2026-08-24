@@ -32,7 +32,7 @@ pub fn dispatch(cli: Cli) -> Result<u8> {
 
         Command::Create(args) => {
             validate_id(&args.id)?;
-            lifecycle::create(&layout, args, rootless)?;
+            lifecycle::create(&layout, args, rootless, cli.otlp_endpoint.as_deref())?;
             Ok(0)
         }
 
@@ -44,7 +44,7 @@ pub fn dispatch(cli: Cli) -> Result<u8> {
 
         Command::Run(args) => {
             validate_id(&args.id)?;
-            lifecycle::run(&layout, args, rootless)
+            lifecycle::run(&layout, args, rootless, cli.otlp_endpoint.as_deref())
         }
 
         Command::Exec(args) => {

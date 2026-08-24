@@ -11,9 +11,9 @@ const MAX_MESSAGE: usize = 16 * 1024;
 pub enum Message {
     RequestUserMapping,
     UserMappingDone,
-    InitPid(i32),
+    InitPid(i32, Vec<crate::telemetry::Phase>),
     CgroupApplied(i32),
-    InitReady,
+    InitReady(Vec<crate::telemetry::Phase>),
     Failed(String),
 }
 
@@ -57,9 +57,9 @@ impl Channel {
         }
         .and_then(|m| match (&m, want) {
             (Message::UserMappingDone, "UserMappingDone")
-            | (Message::InitPid(_), "InitPid")
+            | (Message::InitPid(..), "InitPid")
             | (Message::CgroupApplied(_), "CgroupApplied")
-            | (Message::InitReady, "InitReady")
+            | (Message::InitReady(_), "InitReady")
             | (Message::RequestUserMapping, "RequestUserMapping") => Ok(m),
             _ => Err(Error::Sync(format!("expected {want}, got {m:?}"))),
         })

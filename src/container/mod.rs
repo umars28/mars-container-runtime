@@ -5,7 +5,9 @@ pub mod fifo;
 pub mod hooks;
 pub mod init;
 pub mod process;
+pub mod seccomp;
 pub mod signal;
+pub mod userns;
 
 use std::fs;
 use std::os::fd::OwnedFd;
@@ -27,6 +29,7 @@ use crate::paths::Layout;
 use crate::rootfs::overlay::{self, Layers};
 use crate::state::{self, Container, OciState, Persisted, Status};
 use crate::sync::{self, Channel, Message};
+use crate::telemetry;
 
 pub struct CreateOptions {
     pub id: String,
@@ -47,7 +50,12 @@ pub struct Plan<'a> {
     pub state: OciState,
 }
 
-pub fn create(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Result<()> {
+pub fn create(
+    layout: &Layout,
+    bundle: &Bundle,
+    options: &CreateOptions,
+    clock: &mut telemetry::Recorder,
+) -> Result<()> {
     let layout = layout.clone();
 
     if layout.exists(&options.id) {
@@ -66,7 +74,7 @@ pub fn create(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Resu
     let dir = layout.container_dir(&options.id);
     fs::create_dir_all(&dir).ctx(format!("create {}", dir.display()))?;
 
-    match build(&layout, bundle, options) {
+    match build(&layout, bundle, options, clock) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_dir_all(&dir);
@@ -75,7 +83,12 @@ pub fn create(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Resu
     }
 }
 
-fn build(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Result<()> {
+fn build(
+    layout: &Layout,
+    bundle: &Bundle,
+    options: &CreateOptions,
+    clock: &mut telemetry::Recorder,
+) -> Result<()> {
     let terminal = bundle.terminal();
 
     match (&options.console_socket, terminal) {
@@ -94,9 +107,10 @@ fn build(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Result<()
         _ => {}
     }
 
+    clock.begin("plan");
     let namespaces = namespace::layout(&bundle.namespaces())?;
     let cgroup_ns = namespaces.create.contains(CloneFlags::CLONE_NEWCGROUP);
-    let unshare_flags = namespaces.create & !CloneFlags::CLONE_NEWCGROUP;
+    let unshare_flags = namespace::without(namespaces.create, CloneFlags::CLONE_NEWCGROUP);
 
     let rootfs = bundle.rootfs()?;
     let overlay_layers = bundle.overlay()?;
@@ -125,6 +139,7 @@ fn build(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Result<()
         return Err(Error::RootfsMissing(rootfs));
     }
 
+    clock.begin("cgroup");
     let relative = v2::relative_path(bundle.cgroups_path().as_deref(), &options.id);
     let cgroup = Cgroup::create(&relative)?;
     tracing::debug!(cgroup = %cgroup.path().display(), "cgroup created");
@@ -146,6 +161,7 @@ fn build(layout: &Layout, bundle: &Bundle, options: &CreateOptions) -> Result<()
         namespaces.join,
         cgroup_ns,
         &cgroup,
+        clock,
     );
 
     if outcome.is_err() {
@@ -166,6 +182,7 @@ fn spawn(
     join: Vec<(oci_spec::runtime::LinuxNamespaceType, PathBuf)>,
     cgroup_ns: bool,
     cgroup: &Cgroup,
+    clock: &mut telemetry::Recorder,
 ) -> Result<()> {
     let fifo = fifo::create(&layout.exec_fifo(&options.id))?;
 
@@ -206,6 +223,8 @@ fn spawn(
     let _blocked = signal::block_forwardable()?;
 
     let (parent, child) = sync::pair()?;
+    clock.begin("fork");
+    let forked_at = clock.elapsed_us();
 
     match unsafe { fork() }? {
         ForkResult::Child => {
@@ -217,7 +236,16 @@ fn spawn(
         } => {
             drop(child);
 
-            match handshake(&parent, intermediate, &plan, cgroup, layout, options) {
+            match handshake(
+                &parent,
+                intermediate,
+                &plan,
+                cgroup,
+                layout,
+                options,
+                clock,
+                forked_at,
+            ) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let _ = fs::remove_file(layout.exec_fifo(&options.id));
@@ -229,6 +257,7 @@ fn spawn(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handshake(
     channel: &Channel,
     intermediate: Pid,
@@ -236,28 +265,61 @@ fn handshake(
     cgroup: &Cgroup,
     layout: &Layout,
     options: &CreateOptions,
+    clock: &mut telemetry::Recorder,
+    forked_at: u64,
 ) -> Result<()> {
-    let init = match channel.recv()? {
-        Message::InitPid(pid) => Pid::from_raw(pid),
-        Message::RequestUserMapping => {
-            return Err(Error::Unimplemented("user namespace uid/gid mapping"));
+    clock.begin("wait.initpid");
+    let mut message = channel.recv()?;
+
+    if matches!(message, Message::RequestUserMapping) {
+        let mappings = plan.bundle.id_mappings();
+        let privileged = nix::unistd::geteuid().is_root();
+
+        userns::write(intermediate, &mappings, privileged)?;
+        channel.send(&Message::UserMappingDone)?;
+
+        tracing::debug!(
+            intermediate = intermediate.as_raw(),
+            uid = mappings.uid.len(),
+            gid = mappings.gid.len(),
+            "id mappings written from outside the user namespace"
+        );
+
+        message = channel.recv()?;
+    }
+
+    let init = match message {
+        Message::InitPid(pid, phases) => {
+            clock.absorb("intermediate", forked_at, phases);
+            Pid::from_raw(pid)
         }
         Message::Failed(reason) => return Err(Error::InitFailed(reason)),
         other => return Err(Error::Sync(format!("expected InitPid, got {other:?}"))),
     };
 
+    clock.begin("reap.intermediate");
     waitpid(intermediate, None)?;
 
+    clock.begin("cgroup.attach");
     cgroup.add_process(init)?;
 
     let mut state = plan.state.clone();
     state.pid = Some(init.as_raw());
 
+    clock.begin("hooks.createRuntime");
     hooks::run(plan.bundle.hooks(), hooks::Phase::Prestart, &state)?;
     hooks::run(plan.bundle.hooks(), hooks::Phase::CreateRuntime, &state)?;
 
+    clock.begin("init");
+    let init_started = clock.elapsed_us();
     channel.send(&Message::CgroupApplied(init.as_raw()))?;
-    channel.expect("InitReady")?;
+
+    let phases = match channel.expect("InitReady")? {
+        Message::InitReady(phases) => phases,
+        other => return Err(Error::Sync(format!("expected InitReady, got {other:?}"))),
+    };
+
+    clock.begin("state");
 
     let persisted = Persisted {
         oci_version: OCI_VERSION.to_string(),
@@ -274,6 +336,9 @@ fn handshake(
 
     Container::save(layout, &persisted)?;
     state::write_pid_file(options.pid_file.as_deref(), init)?;
+
+    clock.end();
+    clock.absorb("init", init_started, phases);
 
     tracing::debug!(init = init.as_raw(), id = %options.id, "container created");
 
@@ -301,10 +366,12 @@ pub fn run(
     options: &CreateOptions,
     detach: bool,
     keep: bool,
+    clock: &mut telemetry::Recorder,
+    exported: &dyn Fn(&mut telemetry::Recorder),
 ) -> Result<u8> {
     let blocked = signal::block_forwardable()?;
 
-    create(layout, bundle, options)?;
+    create(layout, bundle, options, clock)?;
 
     let container = Container::load(layout, &options.id)?;
     let init = container.pid();
@@ -316,6 +383,8 @@ pub fn run(
         hooks::Phase::Poststart,
         &container.oci_state(),
     )?;
+
+    exported(clock);
 
     if detach {
         return Ok(0);
@@ -372,7 +441,18 @@ pub fn kill(layout: &Layout, id: &str, signal: Signal, all: bool) -> Result<()> 
 }
 
 pub fn delete(layout: &Layout, id: &str, force: bool) -> Result<()> {
-    let container = Container::load(layout, id)?;
+    let container = match Container::load(layout, id) {
+        Ok(container) => container,
+        Err(Error::NotFound(_)) if force => {
+            tracing::debug!(
+                id,
+                "delete --force on a container that is already gone; containerd calls this during \
+                 cleanup and expects it to succeed"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let status = container.status();
 
     if status != Status::Stopped {

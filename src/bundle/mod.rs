@@ -100,8 +100,60 @@ impl Bundle {
             .unwrap_or(false)
     }
 
+    pub fn readonly_rootfs(&self) -> bool {
+        self.spec
+            .root()
+            .as_ref()
+            .and_then(|root| root.readonly())
+            .unwrap_or(false)
+    }
+
+    pub fn masked_paths(&self) -> Vec<String> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.masked_paths().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn readonly_paths(&self) -> Vec<String> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.readonly_paths().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn seccomp(&self) -> Option<&oci_spec::runtime::LinuxSeccomp> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.seccomp().as_ref())
+    }
+
+    pub fn id_mappings(&self) -> crate::container::userns::Mappings {
+        let linux = self.spec.linux().as_ref();
+
+        crate::container::userns::Mappings {
+            uid: linux
+                .and_then(|linux| linux.uid_mappings().clone())
+                .unwrap_or_default(),
+            gid: linux
+                .and_then(|linux| linux.gid_mappings().clone())
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn process(&self) -> Option<&oci_spec::runtime::Process> {
         self.spec.process().as_ref()
+    }
+
+    pub fn time_offsets(&self) -> HashMap<String, oci_spec::runtime::LinuxTimeOffset> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.time_offsets().clone())
+            .unwrap_or_default()
     }
 
     pub fn sysctl(&self) -> HashMap<String, String> {

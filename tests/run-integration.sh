@@ -68,7 +68,7 @@ bundle() {
   mkdir -p "$dir"
   "$MARS" spec --bundle "$dir"
   cp -a "$WORK/rootfs" "$dir/rootfs"
-  jq "$jq_filter | .process.terminal = false" "$dir/config.json" >"$dir/c.tmp"
+  jq "$jq_filter | .process.terminal = false | .root.readonly = false" "$dir/config.json" >"$dir/c.tmp"
   mv "$dir/c.tmp" "$dir/config.json"
 }
 
@@ -86,6 +86,7 @@ overlay_bundle() {
   jq --arg lower "$lower" "$jq_filter
      | .root.path = \"merged\"
      | .process.terminal = false
+     | .root.readonly = false
      | .annotations[\"dev.mars.overlay.lowerdir\"] = \$lower
      | .annotations[\"dev.mars.overlay.upperdir\"] = \"diff\"
      | .annotations[\"dev.mars.overlay.workdir\"] = \"work\"" \
@@ -715,6 +716,104 @@ check "no state directory is left behind" "1" "$(
   test -d "$ROOT/nobin"
   echo $?
 )"
+
+echo
+echo "read-only rootfs, maskedPaths and readonlyPaths"
+bundle "$WORK/ro" '.process.args = ["/bin/sh","-c","touch /nope 2>&1 | head -1; cat /proc/kcore | head -c 8; echo kcore-empty; echo x > /proc/sys/kernel/hostname 2>&1 | head -1"]'
+jq '.root.readonly = true' "$WORK/ro/config.json" >"$WORK/ro/c.tmp"
+mv "$WORK/ro/c.tmp" "$WORK/ro/config.json"
+mapfile -t ro < <(run_in "$WORK/ro" ro 2>&1)
+check_error "the rootfs is read-only" "read-only file system" "${ro[0]:-<none>}"
+check "a masked path reads as empty" "kcore-empty" "${ro[1]:-<none>}"
+check_error "a readonly path cannot be written" "read-only file system" "${ro[2]:-<none>}"
+
+bundle "$WORK/rw" '.process.args = ["/bin/sh","-c","touch /yes && echo writable"]'
+check "the rootfs is writable when the spec says so" "writable" "$(run_in "$WORK/rw" rw)"
+
+echo
+echo "seccomp gives each rule its own errno"
+bundle "$WORK/sec" '.process.args = ["/bin/sh","-c","chmod 700 /tmp 2>&1 | head -1; mkdir /tmp/d 2>&1 | head -1"]
+  | .linux.seccomp = {"defaultAction":"SCMP_ACT_ALLOW",
+      "syscalls":[{"names":["chmod","fchmodat"],"action":"SCMP_ACT_ERRNO","errnoRet":1},
+                  {"names":["mkdir","mkdirat"],"action":"SCMP_ACT_ERRNO","errnoRet":38}]}'
+mapfile -t sec < <(run_in "$WORK/sec" sec 2>&1)
+check_error "the first rule returns its own errno (EPERM)" "operation not permitted" "${sec[0]:-<none>}"
+check_error "the second rule returns a different errno (ENOSYS)" "not implemented" "${sec[1]:-<none>}"
+
+bundle "$WORK/secnnp" '.process.args = ["/bin/sh","-c","grep NoNewPrivs /proc/self/status"]
+  | .process.noNewPrivileges = false
+  | .linux.seccomp = {"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["mount"],"action":"SCMP_ACT_ERRNO"}]}'
+check "loading a filter does not turn on no_new_privs behind the spec's back" "NoNewPrivs:	0"   "$(run_in "$WORK/secnnp" secnnp)"
+
+echo
+echo "a user namespace with id mappings"
+HOST_USERNS=$(readlink /proc/self/ns/user)
+bundle "$WORK/uns" '.process.args = ["/bin/sh","-c","id -u; cat /proc/self/uid_map; readlink /proc/self/ns/user; echo x > /dev/null && echo devnull-works"]
+  | .linux.namespaces += [{"type":"user"}]
+  | .linux.uidMappings = [{"containerID":0,"hostID":100000,"size":65536}]
+  | .linux.gidMappings = [{"containerID":0,"hostID":100000,"size":65536}]'
+mapfile -t uns < <(run_in "$WORK/uns" uns 2>&1)
+check "the process is root inside the namespace" "0" "${uns[0]:-<none>}"
+check "the mapping the spec asked for is in place" "         0     100000      65536" "${uns[1]:-<none>}"
+if [[ "${uns[2]:-}" != "$HOST_USERNS" && -n "${uns[2]:-}" ]]; then
+  ok "the user namespace differs from the host's (${uns[2]})"
+else
+  no "the user namespace differs from the host's" "not $HOST_USERNS" "${uns[2]:-<none>}"
+fi
+check "device nodes work, bind-mounted because mknod is refused in a user namespace" "devnull-works" "${uns[3]:-<none>}"
+
+bundle "$WORK/unsbad" '.process.args = ["/bin/true"]
+  | .linux.namespaces += [{"type":"user"}]
+  | .linux.uidMappings = [{"containerID":0,"hostID":100000,"size":1}]'
+rejects "a user namespace with only a uid map is refused" "$WORK/unsbad" "gidMappings"
+
+echo
+echo "the time namespace, which docker asks for by default"
+bundle "$WORK/tns" '.process.args = ["/bin/sh","-c","readlink /proc/self/ns/time"]
+  | .linux.namespaces += [{"type":"time"}]'
+host_time_ns=$(readlink /proc/self/ns/time)
+guest_time_ns=$(run_in "$WORK/tns" tns 2>&1)
+if [[ -n "$guest_time_ns" && "$guest_time_ns" != "$host_time_ns" ]]; then
+  ok "a time namespace is created ($guest_time_ns)"
+else
+  no "a time namespace is created" "not $host_time_ns" "${guest_time_ns:-<none>}"
+fi
+
+echo
+echo "delete --force is idempotent, because containerd calls it during cleanup"
+"${M[@]}" delete --force never-existed
+check "deleting a container that was never created succeeds" "0" "$?"
+"${M[@]}" delete never-existed 2>/dev/null
+check "deleting it without --force still reports it missing" "1" "$?"
+
+echo
+echo "the startup trace is valid OTLP that a collector accepts"
+if command -v python3 >/dev/null; then
+  bundle "$WORK/otlp" '.process.args = ["/bin/true"]'
+  rm -f "$WORK/otlp.out"
+  python3 "$(dirname "$0")/otlp-capture.py" 4319 "$WORK/otlp.out" &
+  receiver=$!
+  sleep 1
+  MARS_OTLP_ENDPOINT=127.0.0.1:4319 run_in "$WORK/otlp" otlp >/dev/null 2>&1
+  wait "$receiver" 2>/dev/null
+  if [[ -s "$WORK/otlp.out" ]]; then
+    span_count=$(sed -n 1p "$WORK/otlp.out")
+    trace_id=$(sed -n 2p "$WORK/otlp.out")
+    names=$(sed -n 3p "$WORK/otlp.out")
+    check "the collector received a parseable OTLP document" "0" "$(
+      [[ "$span_count" -gt 5 ]]
+      echo $?
+    )"
+    check "the trace id is 16 bytes of hex" "32" "${#trace_id}"
+    check_error "the parent measures the fork" "wait.initpid" "$names"
+    check_error "the child's own phases are folded in" "init.pivot_root" "$names"
+    check_error "each namespace unshare is timed separately" "intermediate.unshare.net" "$names"
+  else
+    no "the collector received an OTLP document" "a payload" "nothing"
+  fi
+else
+  no "OTLP export test" "python3" "not installed"
+fi
 
 echo
 echo "$PASS passed, $FAIL failed"

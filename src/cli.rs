@@ -35,6 +35,9 @@ pub struct Cli {
     )]
     pub rootless: Option<Rootless>,
 
+    #[arg(long, global = true, value_name = "HOST:PORT")]
+    pub otlp_endpoint: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

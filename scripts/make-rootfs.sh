@@ -6,7 +6,7 @@ OUT="${1:-rootfs}"
 TMP_NAME="mars-rootfs-$$"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "error: run this inside the mars-dev VM, not on macOS" >&2
+  echo "error: this needs Linux" >&2
   exit 1
 fi
 

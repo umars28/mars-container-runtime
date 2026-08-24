@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-MARS="${MARS:-/var/tmp/mars-target/debug/mars}"
+if [[ -z "${MARS:-}" ]]; then
+  for candidate in target/debug/mars target/release/mars \
+    "${CARGO_TARGET_DIR:-}/debug/mars" /var/tmp/mars-target/debug/mars; do
+    [[ -x "$candidate" ]] && MARS=$candidate && break
+  done
+fi
+MARS="${MARS:-target/debug/mars}"
 WORK="${WORK:-/tmp/mars-it}"
 IMAGE="${IMAGE:-alpine:3.20}"
 
@@ -9,7 +15,7 @@ PASS=0
 FAIL=0
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "error: run this inside the mars-dev VM" >&2
+  echo "error: this needs Linux; namespaces and cgroups do not exist elsewhere" >&2
   exit 1
 fi
 

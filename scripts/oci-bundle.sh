@@ -38,7 +38,7 @@ shift $((OPTIND - 1))
 BUNDLE=$1
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "error: run this inside the mars-dev VM, not on macOS" >&2
+  echo "error: this needs Linux" >&2
   exit 1
 fi
 

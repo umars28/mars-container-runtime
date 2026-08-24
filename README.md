@@ -147,6 +147,29 @@ under `user.slice`, `fuse-overlayfs` or `userxattr` for whiteouts, and `slirp4ne
 | 6 | Docker drop-in, OTLP tracing of the startup path | [writeup](docs/06-docker-and-tracing.md) |
 | 7 | Writeups, failure modes, CI | done |
 
+## Running it on your own machine
+
+Check the host first — most of what can go wrong is the host, not the build:
+
+```sh
+./scripts/preflight.sh
+```
+
+The one that stops people: **a VPS that is itself a container.** OpenVZ, LXC and most budget plans
+share the provider's kernel, which blocks `pivot_root` and cgroup delegation. `systemd-detect-virt -c`
+naming anything other than `none` means `mars` cannot run there and no amount of `sudo` changes it —
+you need KVM, Xen, or bare metal. The other common blocker is a hybrid cgroup hierarchy; `mars` has no
+v1 driver, so `/sys/fs/cgroup` must be `cgroup2fs`.
+
+On a Debian or Ubuntu host that passes preflight:
+
+```sh
+sudo apt-get install -y build-essential pkg-config libseccomp-dev jq attr uidmap
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # the distro rustc is often too old
+cargo build --release
+sudo install -m 0755 target/release/mars /usr/local/bin/mars
+```
+
 ## Development
 
 Linux-only: it needs namespaces, cgroups, and `libseccomp`. It does not build on macOS. A

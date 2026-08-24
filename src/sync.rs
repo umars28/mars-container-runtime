@@ -12,6 +12,7 @@ pub enum Message {
     RequestUserMapping,
     UserMappingDone,
     InitPid(i32),
+    CgroupApplied,
     InitReady,
     Start,
     Failed(String),
@@ -58,6 +59,7 @@ impl Channel {
         .and_then(|m| match (&m, want) {
             (Message::UserMappingDone, "UserMappingDone")
             | (Message::InitPid(_), "InitPid")
+            | (Message::CgroupApplied, "CgroupApplied")
             | (Message::InitReady, "InitReady")
             | (Message::Start, "Start")
             | (Message::RequestUserMapping, "RequestUserMapping") => Ok(m),

@@ -1,4 +1,5 @@
 pub mod bundle;
+pub mod cgroup;
 pub mod cli;
 pub mod commands;
 pub mod container;

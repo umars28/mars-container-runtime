@@ -15,10 +15,11 @@ use super::signal;
 pub fn intermediate(
     bundle: &Bundle,
     rootfs_path: &Path,
-    flags: CloneFlags,
+    unshare_flags: CloneFlags,
+    cgroup_ns: bool,
     channel: &Channel,
 ) -> ! {
-    if let Err(error) = stage_one(bundle, rootfs_path, flags, channel) {
+    if let Err(error) = stage_one(bundle, rootfs_path, unshare_flags, cgroup_ns, channel) {
         let _ = channel.send(&Message::Failed(error.to_string()));
     }
 
@@ -28,12 +29,13 @@ pub fn intermediate(
 fn stage_one(
     bundle: &Bundle,
     rootfs_path: &Path,
-    flags: CloneFlags,
+    unshare_flags: CloneFlags,
+    cgroup_ns: bool,
     channel: &Channel,
 ) -> Result<()> {
-    unshare(flags)?;
+    unshare(unshare_flags)?;
 
-    if flags.contains(CloneFlags::CLONE_NEWUSER) {
+    if unshare_flags.contains(CloneFlags::CLONE_NEWUSER) {
         channel.send(&Message::RequestUserMapping)?;
         channel.expect("UserMappingDone")?;
     }
@@ -44,7 +46,9 @@ fn stage_one(
             std::process::exit(0);
         }
         ForkResult::Child => {
-            if let Err(error) = container_init(bundle, rootfs_path, flags, channel) {
+            if let Err(error) =
+                container_init(bundle, rootfs_path, unshare_flags, cgroup_ns, channel)
+            {
                 let _ = channel.send(&Message::Failed(error.to_string()));
             }
             std::process::exit(1);
@@ -55,13 +59,21 @@ fn stage_one(
 fn container_init(
     bundle: &Bundle,
     rootfs_path: &Path,
-    flags: CloneFlags,
+    unshare_flags: CloneFlags,
+    cgroup_ns: bool,
     channel: &Channel,
 ) -> Result<()> {
-    if flags.contains(CloneFlags::CLONE_NEWNS) {
+    channel.expect("CgroupApplied")?;
+
+    if cgroup_ns {
+        unshare(CloneFlags::CLONE_NEWCGROUP)?;
+    }
+
+    if unshare_flags.contains(CloneFlags::CLONE_NEWNS) {
         rootfs::pivot::make_root_private()?;
         rootfs::pivot::make_mount_point(rootfs_path)?;
         rootfs::mounts::apply(rootfs_path, &bundle.mounts())?;
+        rootfs::devices::create(rootfs_path, &bundle.devices())?;
         rootfs::pivot::pivot(rootfs_path)?;
     }
 

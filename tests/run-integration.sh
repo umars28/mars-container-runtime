@@ -185,5 +185,110 @@ else
 fi
 
 echo
+echo "device nodes in a fresh /dev tmpfs"
+bundle "$WORK/dev" '.process.args = ["/bin/sh","-c","echo x > /dev/null && echo null-ok; head -c 4 /dev/zero | wc -c; [ -L /dev/stdout ] && echo stdout-symlink-ok"]'
+mapfile -t dev < <(run_in "$WORK/dev" it-dev)
+check "/dev/null is writable" "null-ok" "${dev[0]:-<none>}"
+check "/dev/zero reads" "4" "${dev[1]:-<none>}"
+check "/dev/stdout is a symlink into /proc/self/fd" "stdout-symlink-ok" "${dev[2]:-<none>}"
+
+echo
+echo "cgroup placement and cleanup"
+bundle "$WORK/cg" '.process.args = ["/bin/sleep","10"]'
+rm -f "$WORK/cg.pid"
+env -C "$WORK/cg" "$MARS" run --pid-file "$WORK/cg.pid" it-cg &
+runtime_pid=$!
+if await_init "$WORK/cg.pid"; then
+  init_pid=$(cat "$WORK/cg.pid")
+  cg=/sys/fs/cgroup/mars/it-cg
+
+  if [[ -d "$cg" ]]; then
+    ok "cgroup created at $cg"
+    check "init pid is in cgroup.procs" "$init_pid" "$(head -1 "$cg/cgroup.procs")"
+    check "memory controller is delegated here" "0" "$(
+      grep -qw memory "$cg/../cgroup.subtree_control"
+      echo $?
+    )"
+  else
+    no "cgroup created at $cg" "a directory" "missing"
+  fi
+
+  kill -KILL "$init_pid"
+  wait "$runtime_pid"
+
+  if [[ ! -d /sys/fs/cgroup/mars ]]; then
+    ok "cgroup tree removed when the container exits"
+  else
+    no "cgroup tree removed when the container exits" "gone" "$(ls /sys/fs/cgroup/mars)"
+  fi
+else
+  no "pid file written by the runtime" "a pid" "nothing"
+  kill -KILL "$runtime_pid" 2>/dev/null
+fi
+
+echo
+echo "cgroup namespace"
+bundle "$WORK/cgns" '.process.args = ["/bin/sh","-c","cat /proc/self/cgroup"]'
+cgns=$(run_in "$WORK/cgns" it-cgns)
+check "container sees its own cgroup as the root" "0::/" "$cgns"
+
+echo
+echo "memory.max and OOM kill"
+bundle "$WORK/oom" '.linux.resources.memory.limit = 33554432
+  | .process.args = ["/usr/bin/awk","BEGIN{s=\"\";while(1){s = s sprintf(\"%1000000s\",\"\")}}"]'
+oom_log=$(run_in "$WORK/oom" it-oom 2>&1)
+check "OOM kill is reported as 128+9" "137" "$?"
+if grep -q "OOM killed" <<<"$oom_log"; then
+  ok "runtime names memory.max as the cause, read from memory.events"
+else
+  no "runtime explains the OOM kill" "a warning naming memory.max" "$oom_log"
+fi
+
+echo
+echo "cpu.max quota causes throttling"
+bundle "$WORK/cpu" '.linux.resources.cpu.quota = 10000
+  | .linux.resources.cpu.period = 100000
+  | .process.args = ["/bin/sh","-c","i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done"]'
+cpu_log=$(run_in "$WORK/cpu" it-cpu 2>&1)
+if grep -q "CPU throttled" <<<"$cpu_log"; then
+  ok "runtime reports throttling, read from cpu.stat"
+else
+  no "runtime reports throttling" "a message naming cpu.max" "$cpu_log"
+fi
+
+echo
+echo "pids.max blocks fork"
+bundle "$WORK/pids" '.linux.resources.pids.limit = 5
+  | .process.args = ["/bin/sh","-c","for i in 1 2 3 4 5 6 7 8 9 10; do sleep 3 & done; echo all-forked"]'
+pids_log=$(run_in "$WORK/pids" it-pids 2>&1)
+if grep -qi "can.t fork" <<<"$pids_log"; then
+  ok "fork rejected with EAGAIN once pids.max is reached"
+else
+  no "fork rejected once pids.max is reached" "a fork failure" "$pids_log"
+fi
+
+echo
+echo "zombie reaping is the application's job, not the runtime's"
+bundle "$WORK/zombie" '.process.args = ["/bin/sh","-c","{ sleep 0.3; } & exec sleep 4"]'
+rm -f "$WORK/zombie.pid"
+env -C "$WORK/zombie" "$MARS" run --pid-file "$WORK/zombie.pid" it-zombie &
+runtime_pid=$!
+if await_init "$WORK/zombie.pid"; then
+  init_pid=$(cat "$WORK/zombie.pid")
+  sleep 1.2
+  zombies=$(ps -o stat= --ppid "$init_pid" 2>/dev/null | grep -c '^Z')
+  if [[ "$zombies" -ge 1 ]]; then
+    ok "PID 1 is the application after execve, so orphans stay unreaped ($zombies zombie)"
+  else
+    no "orphans stay unreaped under a non-init PID 1" "at least one zombie" "$zombies"
+  fi
+  kill -KILL "$init_pid"
+  wait "$runtime_pid"
+else
+  no "pid file written by the runtime" "a pid" "nothing"
+  kill -KILL "$runtime_pid" 2>/dev/null
+fi
+
+echo
 echo "$PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

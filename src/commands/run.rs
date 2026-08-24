@@ -22,6 +22,7 @@ pub fn run(args: &RunArgs) -> Result<u8> {
     container::run(
         &bundle,
         &RunOptions {
+            id: args.id.clone(),
             pid_file: args.pid_file.clone(),
         },
     )

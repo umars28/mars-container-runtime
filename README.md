@@ -7,9 +7,9 @@ Kubernetes sit on top of, built to understand it rather than to replace it.
 a filesystem bundle and a `config.json`, then uses Linux namespaces, cgroup v2, and OverlayFS to
 turn it into an isolated process. The goal is to be a drop-in `--runtime` for Docker.
 
-> **Status: early.** `mars run` starts real isolated containers today — namespaces, `pivot_root`,
-> PID 1, signal forwarding, exit code propagation. There is no cgroup driver yet, so resource
-> limits are not enforced, and `create`/`start` are not yet split. See [Roadmap](#roadmap).
+> **Status: early.** `mars run` starts real isolated containers today, with namespaces, cgroup v2
+> resource limits, device nodes, signal forwarding, and exit code propagation. Still missing:
+> OverlayFS, the `create`/`start` split, seccomp, and rootless. See [Roadmap](#roadmap).
 
 ## Why build this when runc exists?
 
@@ -28,9 +28,10 @@ Reading the documentation does not build a mental model for these. Writing the r
 
 The verifiable outputs are the point: passing the OCI validation suite, running as
 `docker run --runtime=mars`, and [`docs/failure-modes.md`](docs/failure-modes.md) reproducing each
-failure above with evidence read straight from the kernel. Two are written up already — why
-`docker stop` appears to do nothing for ten seconds, and why mounting `/sys/fs/cgroup` fails with
-`EPERM` on a modern host while running as root.
+failure above with evidence read straight from the kernel. Five are written up so far, including one
+that surprised me: **an OOM kill does not always produce exit 137.** The kernel picks its victim by
+badness score, so it often kills a child rather than PID 1 — and the container then exits `0` while
+having lost a process. Nothing watching exit codes can see it.
 
 ## Design notes
 
@@ -91,7 +92,7 @@ networking, checkpoint/restore, CRI, cgroup v1, and the systemd cgroup driver.
 |---|---|---|
 | 0 | Dev VM, toolchain, CLI surface, `spec` generation | done |
 | 1 | Namespaces, `pivot_root`, PID 1 duties — [writeup](docs/01-isolation.md) | done |
-| 2 | cgroup v2 driver, OOMKilled reproduction | not started |
+| 2 | cgroup v2 driver, OOMKilled reproduction — [writeup](docs/02-cgroups.md) | done |
 | 3 | OverlayFS, OCI bundle parsing | not started |
 | 4 | Full lifecycle, passes OCI validation | not started |
 | 5 | Capabilities, seccomp, rootless | not started |

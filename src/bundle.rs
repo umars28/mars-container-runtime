@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use oci_spec::runtime::{LinuxNamespace, Mount, Spec};
+use oci_spec::runtime::{LinuxDevice, LinuxNamespace, LinuxResources, Mount, Spec};
 
 use crate::error::{Error, IoContext, Result};
 
@@ -50,6 +50,28 @@ impl Bundle {
 
     pub fn mounts(&self) -> Vec<Mount> {
         self.spec.mounts().clone().unwrap_or_default()
+    }
+
+    pub fn devices(&self) -> Vec<LinuxDevice> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.devices().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn resources(&self) -> Option<LinuxResources> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.resources().clone())
+    }
+
+    pub fn cgroups_path(&self) -> Option<PathBuf> {
+        self.spec
+            .linux()
+            .as_ref()
+            .and_then(|linux| linux.cgroups_path().clone())
     }
 
     pub fn hostname(&self) -> Option<&str> {

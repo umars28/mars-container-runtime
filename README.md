@@ -8,8 +8,9 @@ a filesystem bundle and a `config.json`, then uses Linux namespaces, cgroup v2, 
 turn it into an isolated process. The goal is to be a drop-in `--runtime` for Docker.
 
 > **Status: early.** `mars run` starts real isolated containers today, with namespaces, cgroup v2
-> resource limits, device nodes, signal forwarding, and exit code propagation. Still missing:
-> OverlayFS, the `create`/`start` split, seccomp, and rootless. See [Roadmap](#roadmap).
+> resource limits, an OverlayFS rootfs assembled from image layers, device nodes, signal forwarding,
+> and exit code propagation. Still missing: the `create`/`start` split, seccomp, and rootless. See
+> [Roadmap](#roadmap).
 
 ## Why build this when runc exists?
 
@@ -23,15 +24,24 @@ failures in production happen in the layer that Docker hides:
 - a container ignores `SIGTERM` — because PID 1 has no default signal handlers
 - zombie processes pile up — because PID 1 never reaped its orphans
 - CPU throttles while utilisation looks low — because `cpu.max` is a quota, not a share
+- a fix applied with `exec` survives a restart but not a recreate — because it lived in the
+  OverlayFS upper layer, which *is* the container
 
 Reading the documentation does not build a mental model for these. Writing the runtime does.
 
 The verifiable outputs are the point: passing the OCI validation suite, running as
 `docker run --runtime=mars`, and [`docs/failure-modes.md`](docs/failure-modes.md) reproducing each
-failure above with evidence read straight from the kernel. Five are written up so far, including one
-that surprised me: **an OOM kill does not always produce exit 137.** The kernel picks its victim by
-badness score, so it often kills a child rather than PID 1 — and the container then exits `0` while
-having lost a process. Nothing watching exit codes can see it.
+failure above with evidence read straight from the kernel. Seven are written up so far, including two
+that surprised me:
+
+**An OOM kill does not always produce exit 137.** The kernel picks its victim by badness score, so it
+often kills a child rather than PID 1 — and the container then exits `0` while having lost a process.
+Nothing watching exit codes can see it.
+
+**A mount option string over 4096 bytes is truncated, not rejected.** Enough OverlayFS layers and the
+kernel silently cuts the `lowerdir=` list mid-path, then reports `ENOENT` on the mount *source* — an
+error that names neither the truncation nor the layer count. This is why
+`/var/lib/docker/overlay2/l/` is full of short symlinks.
 
 ## Design notes
 
@@ -71,6 +81,13 @@ the parent turns them into spans.
 **The cgroup driver is hand-written** against `cgroupfs` rather than using a crate. Delegating that
 away would delegate away the main thing this project is for.
 
+**The overlay rootfs is a documented extension, not a spec feature.** The OCI runtime-spec has no
+field for image layers — assembling them is the image-spec's job, which containerd and Docker do
+before the runtime is ever called. `mars` reads three `dev.mars.overlay.*` annotations instead, so
+the `config.json` stays valid for any other runtime, which will simply ignore them. The overlay is
+mounted inside the container's mount namespace, so it never appears on the host and needs no
+teardown.
+
 ## Scope
 
 Implemented or planned:
@@ -93,7 +110,7 @@ networking, checkpoint/restore, CRI, cgroup v1, and the systemd cgroup driver.
 | 0 | Dev VM, toolchain, CLI surface, `spec` generation | done |
 | 1 | Namespaces, `pivot_root`, PID 1 duties — [writeup](docs/01-isolation.md) | done |
 | 2 | cgroup v2 driver, OOMKilled reproduction — [writeup](docs/02-cgroups.md) | done |
-| 3 | OverlayFS, OCI bundle parsing | not started |
+| 3 | OverlayFS rootfs, `config.json` validation — [writeup](docs/03-overlayfs.md) | done |
 | 4 | Full lifecycle, passes OCI validation | not started |
 | 5 | Capabilities, seccomp, rootless | not started |
 | 6 | Docker drop-in, OpenTelemetry to Tempo | not started |
@@ -122,9 +139,23 @@ mars spec --bundle /tmp/demo
 cd /tmp/demo && sudo mars run demo
 ```
 
+For a layered rootfs, `scripts/oci-bundle.sh` unpacks a Docker image into one directory per layer,
+converts the `.wh.` markers in the layer tarballs into real OverlayFS whiteouts, and writes a
+`config.json` whose `process` comes from the image config:
+
+```sh
+sudo -E ./scripts/oci-bundle.sh -i alpine:3.20 /tmp/layered
+cd /tmp/layered && sudo mars run demo
+find /tmp/layered/diff -mindepth 1     # everything the container wrote
+```
+
+`-F` builds a throwaway multi-layer image first, so the bundle has several lower layers and a real
+whiteout to look at.
+
 Verified environment: Ubuntu 24.04, kernel 6.8, aarch64, pure cgroup v2 (`cgroup2fs`) with
 `cpu cpuset io memory pids` controllers, unprivileged user namespaces enabled.
 
 ## License
 
-Apache-2.0
+Copyright 2026 Umar Sabirin. Licensed under the Apache License, Version 2.0 — see
+[LICENSE](LICENSE).

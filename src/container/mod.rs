@@ -2,7 +2,7 @@ pub mod init;
 pub mod signal;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nix::sched::CloneFlags;
 use nix::sys::prctl;
@@ -15,6 +15,7 @@ use crate::cgroup::events;
 use crate::cgroup::v2::{self, Cgroup};
 use crate::error::{Error, IoContext, Result};
 use crate::namespace;
+use crate::rootfs::overlay::{self, Layers};
 use crate::sync::{self, Channel, Message};
 
 pub struct RunOptions {
@@ -22,16 +23,76 @@ pub struct RunOptions {
     pub pid_file: Option<PathBuf>,
 }
 
-pub fn run(bundle: &Bundle, options: &RunOptions) -> Result<u8> {
-    let rootfs = bundle.rootfs()?;
+pub struct Plan<'a> {
+    pub bundle: &'a Bundle,
+    pub rootfs: PathBuf,
+    pub overlay: Option<Layers>,
+    pub unshare_flags: CloneFlags,
+    pub cgroup_ns: bool,
+}
 
-    if !rootfs.is_dir() {
-        return Err(Error::RootfsMissing(rootfs));
+impl<'a> Plan<'a> {
+    pub fn build(bundle: &'a Bundle) -> Result<Self> {
+        let requested = namespace::clone_flags(&bundle.namespaces())?;
+        let cgroup_ns = requested.contains(CloneFlags::CLONE_NEWCGROUP);
+        let unshare_flags = requested & !CloneFlags::CLONE_NEWCGROUP;
+
+        let rootfs = bundle.rootfs()?;
+        let overlay = bundle.overlay()?;
+
+        if let Some(layers) = &overlay {
+            if !unshare_flags.contains(CloneFlags::CLONE_NEWNS) {
+                return Err(Error::Overlay(
+                    "an overlay rootfs needs a mount namespace, otherwise the assembled \
+                     filesystem would stay visible on the host after the container exits"
+                        .to_string(),
+                ));
+            }
+
+            overlay::prepare(layers)?;
+            prepare_merged(&rootfs)?;
+
+            tracing::debug!(
+                lower = layers.lower.len(),
+                readonly = layers.is_readonly(),
+                merged = %rootfs.display(),
+                "overlay rootfs prepared"
+            );
+        }
+
+        if !rootfs.is_dir() {
+            return Err(Error::RootfsMissing(rootfs));
+        }
+
+        Ok(Self {
+            bundle,
+            rootfs,
+            overlay,
+            unshare_flags,
+            cgroup_ns,
+        })
+    }
+}
+
+fn prepare_merged(rootfs: &Path) -> Result<()> {
+    fs::create_dir_all(rootfs).ctx(format!("create overlay mountpoint {}", rootfs.display()))?;
+
+    let mut entries =
+        fs::read_dir(rootfs).ctx(format!("inspect overlay mountpoint {}", rootfs.display()))?;
+
+    if entries.next().is_some() {
+        return Err(Error::Overlay(format!(
+            "root.path {} is not empty; the overlay is mounted over it, so anything already \
+             there would be hidden for the life of the container",
+            rootfs.display()
+        )));
     }
 
-    let requested = namespace::clone_flags(&bundle.namespaces())?;
-    let cgroup_ns = requested.contains(CloneFlags::CLONE_NEWCGROUP);
-    let unshare_flags = requested & !CloneFlags::CLONE_NEWCGROUP;
+    Ok(())
+}
+
+pub fn run(bundle: &Bundle, options: &RunOptions) -> Result<u8> {
+    let plan = Plan::build(bundle)?;
 
     let relative = v2::relative_path(bundle.cgroups_path().as_deref(), &options.id);
     let cgroup = Cgroup::create(&relative)?;
@@ -52,7 +113,7 @@ pub fn run(bundle: &Bundle, options: &RunOptions) -> Result<u8> {
     match unsafe { fork() }? {
         ForkResult::Child => {
             drop(parent);
-            init::intermediate(bundle, &rootfs, unshare_flags, cgroup_ns, &child)
+            init::intermediate(&plan, &child)
         }
         ForkResult::Parent {
             child: intermediate,

@@ -310,8 +310,107 @@ forwards signals in about 200 lines.
 
 ---
 
+## Files written inside a container are gone after it is recreated
+
+**Symptom in production.** Someone fixes a problem by `exec`ing into a running container — installs a
+package, edits a config, drops a certificate in place. It works. The pod restarts, or the deployment
+is rolled, and the fix is gone. Or: a container writes logs to a path nobody mounted, the disk fills
+up, and after `docker rm` the space comes back but the logs are unrecoverable.
+
+**Reproduction.** Three runs of the same bundle. The first writes a file, the second keeps the same
+`upperdir`, the third gets a fresh one:
+
+```sh
+$ jq '.process.args = ["/bin/sh","-c","echo important >/data.txt; cat /data.txt"]' …
+$ mars run first
+important
+$ find diff -mindepth 1 -exec stat -c '%n  %F' {} \;
+/var/tmp/fm-overlay/bundle/diff/data.txt  regular file
+$ ls lower/base/data.txt
+ls: cannot access 'lower/base/data.txt': No such file or directory
+```
+
+The write went to `upperdir`. The lower layer — the image — never saw it. Run it again with the same
+`upperdir` and the file is still there:
+
+```sh
+$ jq '.process.args = ["/bin/sh","-c","cat /data.txt 2>&1"]' …
+$ mars run second
+important
+```
+
+Now discard `upperdir` and `workdir`, which is exactly what `docker rm` followed by `docker run`
+does, and what a Kubernetes pod restart does to a container's writable layer:
+
+```sh
+$ rm -rf diff work && mkdir diff work
+$ mars run third
+cat: can't open '/data.txt': No such file or directory
+```
+
+**Cause.** `upperdir` *is* the container. It is not part of the image and not part of any volume; it
+is a scratch directory whose lifetime is the container's lifetime. Every write that does not land on
+a mounted volume lands there, and is deleted with the container.
+
+This is the mechanism behind a specific and common misdiagnosis. When a fix survives a
+`docker restart` (same container, same `upperdir`) but not a `docker rm && docker run` (new
+container, new `upperdir`), the natural conclusion is that something is wrong with the image or the
+restart policy. Nothing is wrong. The two operations differ in exactly one way, and it is this one.
+
+The corollary is the reason `docker diff` exists: it is a listing of `upperdir`, and therefore a
+listing of everything that will be lost. Anything in it that matters belongs in a volume.
+
+Note also what did *not* happen: the lower layer is byte-identical after all three runs. That is
+guaranteed, not incidental — OverlayFS never writes below the upper layer. It is why one image
+directory can back a thousand containers, and why deleting files inside a container frees no disk
+space (see [phase 3](03-overlayfs.md#deletion-is-a-character-device)).
+
+---
+
+## `mount: special device overlay does not exist`, and the layer count is the real cause
+
+**Symptom in production.** An image with many layers fails to start with an error naming a device
+that does not exist and was never supposed to. Rebuilding the same image with fewer, larger layers
+fixes it, which makes no sense.
+
+**Reproduction.** 41 lower layers with long directory names — 4223 bytes of `lowerdir=`:
+
+```sh
+$ mount -t overlay overlay -o "lowerdir=$ABS,upperdir=$B/diff,workdir=$B/work" $B/merged
+mount: /var/tmp/mars-long/merged: special device overlay does not exist.
+$ dmesg | tail -1
+overlayfs: failed to resolve '/var/tmp/mars-long/layer-with-a-deliberately-long-dire': -2
+```
+
+**Cause.** `mount(2)`'s `data` argument is copied by `copy_mount_options`, which copies at most one
+page — 4096 bytes. A longer option string is not rejected. It is **truncated**, and the kernel then
+tries to resolve whatever partial path it was left holding.
+
+The evidence is in the `dmesg` line. That directory is really named
+`layer-with-a-deliberately-long-directory-name-to-blow-the-page-limit-…`; it appears cut off mid-word
+because that is where byte 4096 fell. And the errno is `ENOENT` attributed to `overlay` — the mount
+*source*, a placeholder string that was never a path and was never the problem.
+
+Nothing in that output says "too many layers". The `dmesg` line is the only clue, and only if you
+notice that the path in it is truncated rather than merely missing.
+
+This is why `/var/lib/docker/overlay2` contains a `l/` directory full of short symlinks like
+`l/BSHXFN2…` pointing at the real layer directories. It looks like obfuscation. It is Docker keeping
+the option string under 4096 bytes.
+
+`mars` measures the string before the syscall, and if it is over the limit, `chdir`s to the deepest
+common parent of the layers and passes relative paths instead:
+
+```
+DEBUG overlay option string exceeded one page, using paths relative to a common parent
+      base=/tmp/mars-it bytes=3742
+```
+
+If even that does not fit, it is reported as a configuration error naming the byte count — never
+handed to the kernel to cut in half.
+
+---
+
 ## Still to come
 
 - `permission denied` on a mount at mode `0777`, caused by user namespace uid remapping (phase 5)
-- writes that vanish on restart, because the OverlayFS upper layer was not where you thought
-  (phase 3)

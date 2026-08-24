@@ -1,3 +1,6 @@
+pub mod validate;
+
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,6 +8,7 @@ use std::path::{Path, PathBuf};
 use oci_spec::runtime::{LinuxDevice, LinuxNamespace, LinuxResources, Mount, Spec};
 
 use crate::error::{Error, IoContext, Result};
+use crate::rootfs::overlay::{self, Layers};
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -25,7 +29,17 @@ impl Bundle {
         let text = fs::read_to_string(&config).ctx(format!("read {}", config.display()))?;
         let spec: Spec = serde_json::from_str(&text)?;
 
+        validate::spec(&spec)?;
+
         Ok(Self { dir, spec })
+    }
+
+    pub fn annotations(&self) -> HashMap<String, String> {
+        self.spec.annotations().clone().unwrap_or_default()
+    }
+
+    pub fn overlay(&self) -> Result<Option<Layers>> {
+        overlay::from_annotations(&self.annotations(), &self.dir)
     }
 
     pub fn rootfs(&self) -> Result<PathBuf> {

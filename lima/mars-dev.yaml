@@ -27,7 +27,7 @@ provision:
       build-essential pkg-config libseccomp-dev libseccomp2 seccomp \
       uidmap dbus-user-session slirp4netns fuse-overlayfs \
       golang-go git curl ca-certificates jq \
-      libcap2-bin util-linux iproute2 iputils-ping strace ltrace
+      libcap2-bin util-linux iproute2 iputils-ping strace ltrace attr
     mkdir -p /var/tmp/mars-target
     chmod 1777 /var/tmp/mars-target
 

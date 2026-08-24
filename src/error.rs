@@ -24,6 +24,12 @@ pub enum Error {
     #[error("config.json is missing required field {0}")]
     SpecField(&'static str),
 
+    #[error("config.json is invalid: {0}")]
+    Invalid(String),
+
+    #[error("overlay rootfs: {0}")]
+    Overlay(String),
+
     #[error("rootfs {0} does not exist or is not a directory")]
     RootfsMissing(PathBuf),
 

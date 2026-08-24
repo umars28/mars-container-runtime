@@ -78,6 +78,42 @@ run_in() {
   (cd "$dir" && "$MARS" run "$@")
 }
 
+overlay_bundle() {
+  local dir=$1 lower=$2 jq_filter=$3
+  rm -rf "$dir"
+  mkdir -p "$dir/diff" "$dir/work" "$dir/merged"
+  "$MARS" spec --bundle "$dir"
+  jq --arg lower "$lower" "$jq_filter
+     | .root.path = \"merged\"
+     | .process.terminal = false
+     | .annotations[\"dev.mars.overlay.lowerdir\"] = \$lower
+     | .annotations[\"dev.mars.overlay.upperdir\"] = \"diff\"
+     | .annotations[\"dev.mars.overlay.workdir\"] = \"work\"" \
+    "$dir/config.json" >"$dir/c.tmp"
+  mv "$dir/c.tmp" "$dir/config.json"
+}
+
+check_error() {
+  local name=$1 needle=$2 output=$3
+  if grep -qi -- "$needle" <<<"$output"; then
+    ok "$name"
+  else
+    no "$name" "an error mentioning $needle" "${output:-<no output>}"
+  fi
+}
+
+rejects() {
+  local name=$1 dir=$2 needle=$3
+  local output status
+  output=$(run_in "$dir" "$(basename "$dir")" 2>&1)
+  status=$?
+  if [[ "$status" -eq 0 ]]; then
+    no "$name" "a non-zero exit and an explanation" "exit 0"
+  else
+    check_error "$name" "$needle" "$output"
+  fi
+}
+
 echo "preparing shared rootfs from $IMAGE"
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -288,6 +324,118 @@ else
   no "pid file written by the runtime" "a pid" "nothing"
   kill -KILL "$runtime_pid" 2>/dev/null
 fi
+
+echo
+echo "config.json validation"
+bundle "$WORK/badhost" '.linux.namespaces = [{"type":"pid"},{"type":"mount"}] | .hostname = "guest"'
+rejects "hostname without a UTS namespace is refused" "$WORK/badhost" "UTS namespace"
+
+bundle "$WORK/badcwd" '.process.cwd = "relative/dir"'
+rejects "a relative process.cwd is refused" "$WORK/badcwd" "not an absolute path"
+
+bundle "$WORK/baddup" '.linux.namespaces += [{"type":"pid"}]'
+rejects "a namespace listed twice is refused" "$WORK/baddup" "more than once"
+
+bundle "$WORK/badver" '.ociVersion = "2.0.0"'
+rejects "a runtime-spec major version we do not implement is refused" "$WORK/badver" "major version"
+
+bundle "$WORK/badenv" '.process.env += ["NOT_A_PAIR"]'
+rejects "a malformed env entry is refused" "$WORK/badenv" "KEY=VALUE"
+
+echo
+echo "preparing overlay lower layers"
+LOWER="$WORK/lower"
+mkdir -p "$LOWER"
+cp -a "$WORK/rootfs" "$LOWER/base"
+mkdir -p "$LOWER/top"
+echo "written by the top layer" >"$LOWER/top/from-top.txt"
+mkdir -p "$LOWER/top/etc"
+mknod "$LOWER/top/etc/hostname" c 0 0
+echo "  base $(du -sh "$LOWER/base" | cut -f1), top adds from-top.txt and whiteouts /etc/hostname"
+
+echo
+echo "overlay rootfs assembled from two lower layers"
+overlay_bundle "$WORK/ovl" "$LOWER/top:$LOWER/base" \
+  '.process.args = ["/bin/sh","-c","cat /from-top.txt; cat /etc/alpine-release; [ -e /etc/hostname ] && echo whiteout-FAILED || echo whiteout-ok; echo from-container > /scratch.txt; rm -f /etc/alpine-release; echo done"]'
+mapfile -t ovl < <(run_in "$WORK/ovl" ovl)
+check "top layer file is visible" "written by the top layer" "${ovl[0]:-<none>}"
+check_prefix "base layer file is visible under it" "3.20" "${ovl[1]:-<none>}"
+check "a whiteout in the top layer hides the base layer file" "whiteout-ok" "${ovl[2]:-<none>}"
+check "container ran to completion" "done" "${ovl[3]:-<none>}"
+
+check "a container write lands in upperdir" "from-container" "$(cat "$WORK/ovl/diff/scratch.txt" 2>/dev/null)"
+check "a container delete becomes a whiteout device in upperdir" "character special file" \
+  "$(stat -c %F "$WORK/ovl/diff/etc/alpine-release" 2>/dev/null)"
+check "the lower layer was not written to" "0" \
+  "$(find "$LOWER" -name scratch.txt | wc -l)"
+check "the deleted file still exists in the lower layer" "0" "$(
+  test -f "$LOWER/base/etc/alpine-release"
+  echo $?
+)"
+if mountpoint -q "$WORK/ovl/merged"; then
+  no "the overlay mount does not leak onto the host" "not a mountpoint" "still mounted"
+else
+  ok "the overlay mount does not leak onto the host"
+fi
+
+echo
+echo "overlay is read-only when no upperdir is given"
+overlay_bundle "$WORK/ovlro" "$LOWER/top:$LOWER/base" \
+  '.process.args = ["/bin/sh","-c","touch /nope 2>&1 || true"]'
+jq 'del(.annotations["dev.mars.overlay.upperdir"], .annotations["dev.mars.overlay.workdir"])' \
+  "$WORK/ovlro/config.json" >"$WORK/ovlro/c.tmp"
+mv "$WORK/ovlro/c.tmp" "$WORK/ovlro/config.json"
+ro_out=$(run_in "$WORK/ovlro" ovlro 2>&1)
+check_error "writing to a read-only overlay fails inside the container" "read-only" "$ro_out"
+
+echo
+echo "overlay option string over one page, the reason overlay2 uses short symlinks"
+PAGE="$WORK/page"
+LONG="layer-with-a-deliberately-long-name-to-blow-past-the-single-page-mount-option-limit"
+rm -rf "$PAGE"
+mkdir -p "$PAGE"
+for i in $(seq -w 1 40); do
+  mkdir -p "$PAGE/$LONG-$i"
+  echo "layer $i" >"$PAGE/$LONG-$i/f$i"
+done
+page_lower=""
+for i in $(seq -w 40 -1 1); do page_lower+="$PAGE/$LONG-$i:"; done
+page_lower+="$LOWER/base"
+if ((${#page_lower} > 4096)); then
+  ok "the absolute option string really is over 4096 bytes (${#page_lower})"
+else
+  no "the absolute option string is over 4096 bytes" "> 4096" "${#page_lower}"
+fi
+
+overlay_bundle "$WORK/ovlpage" "$page_lower" \
+  '.process.args = ["/bin/sh","-c","cat /f01 /f40"]'
+mapfile -t page < <(run_in "$WORK/ovlpage" ovlpage 2>/dev/null)
+check "the bottom-most long-named layer is readable" "layer 01" "${page[0]:-<none>}"
+check "the top-most long-named layer is readable" "layer 40" "${page[1]:-<none>}"
+
+echo
+echo "overlay misconfiguration is diagnosed by the runtime, not left to the kernel"
+overlay_bundle "$WORK/ovlnest" "$LOWER/top:$LOWER/base" '.process.args = ["/bin/true"]'
+jq '.annotations["dev.mars.overlay.workdir"] = "diff/work"' \
+  "$WORK/ovlnest/config.json" >"$WORK/ovlnest/c.tmp"
+mv "$WORK/ovlnest/c.tmp" "$WORK/ovlnest/config.json"
+rejects "workdir nested inside upperdir is named as such" "$WORK/ovlnest" "inside upperdir"
+
+overlay_bundle "$WORK/ovlxdev" "$LOWER/top:$LOWER/base" '.process.args = ["/bin/true"]'
+mount -t tmpfs mars-xdev "$WORK/ovlxdev/work"
+jq '.' "$WORK/ovlxdev/config.json" >/dev/null
+rejects "workdir on another filesystem is named as such" "$WORK/ovlxdev" "same filesystem\|filesystem boundary"
+umount "$WORK/ovlxdev/work"
+
+overlay_bundle "$WORK/ovlone" "$LOWER/base" '.process.args = ["/bin/true"]'
+jq 'del(.annotations["dev.mars.overlay.upperdir"], .annotations["dev.mars.overlay.workdir"])' \
+  "$WORK/ovlone/config.json" >"$WORK/ovlone/c.tmp"
+mv "$WORK/ovlone/c.tmp" "$WORK/ovlone/config.json"
+rejects "a single-layer read-only overlay is named as such" "$WORK/ovlone" "at least 2 lower layers"
+
+overlay_bundle "$WORK/ovlnons" "$LOWER/top:$LOWER/base" \
+  '.process.args = ["/bin/true"] | .linux.namespaces = [{"type":"pid"}] | del(.hostname)'
+rejects "an overlay without a mount namespace is refused" "$WORK/ovlnons" "mount namespace"
 
 echo
 echo "$PASS passed, $FAIL failed"

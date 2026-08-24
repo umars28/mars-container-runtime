@@ -218,4 +218,5 @@ limits cannot be changed.
 `pause`/`resume` would be `cgroup.freeze`, which is a single file write — but it needs the state
 tracking from phase 4 to be useful, since there is nothing to pause once `run` has returned.
 
-The rootfs is still whatever directory the bundle points at, used directly. OverlayFS is phase 3.
+The rootfs is still whatever directory the bundle points at, used directly. OverlayFS is
+[phase 3](03-overlayfs.md).

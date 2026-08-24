@@ -1,0 +1,46 @@
+[package]
+name = "mars"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "An OCI-compliant container runtime written from scratch in Rust"
+repository = "https://github.com/umars28/mars-container-runtime"
+
+[lib]
+name = "mars"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mars"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+caps = "0.5"
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
+libseccomp = "0.4"
+nix = { version = "0.31", features = [
+  "sched",
+  "mount",
+  "process",
+  "signal",
+  "fs",
+  "term",
+  "hostname",
+  "resource",
+  "user",
+  "ioctl",
+] }
+oci-spec = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

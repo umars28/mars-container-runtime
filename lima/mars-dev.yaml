@@ -1,0 +1,87 @@
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+cpus: 4
+memory: 6GiB
+disk: 40GiB
+
+mountType: virtiofs
+mounts:
+- location: "~/Documents/Portfolio/mars-container-runtime"
+  writable: true
+
+env:
+  CARGO_TARGET_DIR: /var/tmp/mars-target
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+      build-essential pkg-config libseccomp-dev libseccomp2 seccomp \
+      uidmap dbus-user-session slirp4netns fuse-overlayfs \
+      golang-go git curl ca-certificates jq \
+      libcap2-bin util-linux iproute2 iputils-ping strace ltrace
+    mkdir -p /var/tmp/mars-target
+    chmod 1777 /var/tmp/mars-target
+
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    . /etc/os-release
+    cat >/etc/apt/sources.list.d/docker.list <<EOF
+    deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable
+    EOF
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io
+
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    u=$(getent passwd 1000 | cut -d: -f1)
+    usermod -aG docker "$u"
+    grep -q "^$u:" /etc/subuid || echo "$u:100000:65536" >>/etc/subuid
+    grep -q "^$u:" /etc/subgid || echo "$u:100000:65536" >>/etc/subgid
+    mkdir -p /etc/systemd/system/user@.service.d
+    cat >/etc/systemd/system/user@.service.d/delegate.conf <<'EOF'
+    [Service]
+    Delegate=cpu cpuset io memory pids
+    EOF
+    systemctl daemon-reload
+
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! command -v rustup >/dev/null 2>&1; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile default --no-modify-path
+    fi
+    . "$HOME/.cargo/env"
+    rustup component add rustfmt clippy
+    for f in "$HOME/.profile" "$HOME/.bashrc"; do
+      grep -q 'cargo/env' "$f" 2>/dev/null || \
+        echo '. "$HOME/.cargo/env"' >>"$f"
+    done
+
+probes:
+- description: rust toolchain and docker ready
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    timeout 600 bash -c 'until [ -x "$HOME/.cargo/bin/cargo" ]; do sleep 3; done'
+    timeout 600 bash -c 'until command -v docker >/dev/null 2>&1; do sleep 3; done'
+  hint: rustup or docker provisioning did not finish

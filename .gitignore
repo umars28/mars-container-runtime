@@ -1,0 +1,7 @@
+/target
+/dist
+/rootfs
+/bundles
+*.log
+*.core
+.DS_Store
